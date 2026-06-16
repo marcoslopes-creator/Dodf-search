@@ -1,0 +1,31 @@
+# ===== Segredos / variaveis de ambiente =====
+.env
+.env.*
+!.env.example
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# ===== Ambiente virtual =====
+venv/
+.venv/
+env/
+
+# ===== Arquivos grandes / dados =====
+*.zip
+indice_busca_textual.json
+indice_busca_vetorial.json
+indice_cache_vetorial.json
+
+# ===== Logs e processos =====
+logs/
+*.log
+.pids/
+
+# ===== Sistema operacional / IDE =====
+.DS_Store
+.idea/
+.vscode/
