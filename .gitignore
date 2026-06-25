@@ -29,3 +29,7 @@ logs/
 .DS_Store
 .idea/
 .vscode/
+
+# ===== Backup e documentos fora do escopo do app =====
+Backup/
+MongoDB_Migracao_Community_Enterprise_OracleLinux9.7_POC.md

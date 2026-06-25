@@ -9,7 +9,8 @@ Melhorias desta versao:
 
 Uso:
   python processar_pdf.py arquivo.pdf
-  python processar_pdf.py --reprocessar
+  python processar_pdf.py --reprocessar        (limpa o banco)
+  python processar_pdf.py --reprocessar-base   (reprocessa in-place)
   python processar_pdf.py --migrar
   python processar_pdf.py --testar-limpeza arquivo.pdf
 """
@@ -54,6 +55,8 @@ _RE_PONTOS_DEPOIS_TEXTO = re.compile(r'(\w)\s*\.{3,}\s*(\w|$)')  # "texto....tex
 
 # Espacos e quebras
 _RE_NBSP = re.compile(r'[\u00a0\u2007\u202f\xa0]')   # nbsp variants
+# Invisiveis: zero-width, soft-hyphen, BOM (removidos por completo)
+_RE_INVISIVEIS = re.compile(r'[\u200b\u200c\u200d\u00ad\ufeff\u2028\u2029]')
 _RE_ESPACOS_HORIZONTAIS = re.compile(r'[ \t\f\v]+')   # multiplos spaces/tabs
 _RE_QUEBRAS_MULTIPLAS = re.compile(r'\n{3,}')         # 3+ quebras viram 2
 _RE_PARAGRAFO = re.compile(
@@ -104,6 +107,7 @@ def _limpar_texto(texto: str) -> str:
     """Pipeline de limpeza — gera texto pronto para chunkificar."""
 
     # 1. Remove caracteres invisiveis e normaliza espacos
+    texto = _RE_INVISIVEIS.sub('', texto)
     texto = _RE_NBSP.sub(' ', texto)
     texto = _RE_BULLETS.sub(' ', texto)
 
@@ -249,11 +253,24 @@ def _registrar_pdf(nome, hash_md5, gridfs_id, tamanho, total_paginas,
 # EXTRACAO COM PROGRESSO POR PAGINA
 # =====================================================================
 
+def _ocr_fallback_pagina(page) -> str:
+    """Renderiza a pagina como imagem e aplica OCR (provedor configurado)."""
+    try:
+        from ocr import ocr_imagem_png
+        pix = page.get_pixmap(dpi=CFG.OCR_DPI)
+        texto = ocr_imagem_png(pix.tobytes("png"))
+        return _limpar_texto(texto) if texto else ""
+    except Exception as e:
+        print(f"          OCR pagina falhou: {str(e)[:100]}", flush=True)
+        return ""
+
+
 def _extrair_texto(pdf_bytes: bytes) -> tuple[list, int]:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     total = len(doc)
     paginas = []
     descartadas = 0
+    ocr_usadas = 0
 
     print(f"        Extraindo texto de {total} paginas...", flush=True)
     t0 = time.time()
@@ -261,22 +278,34 @@ def _extrair_texto(pdf_bytes: bytes) -> tuple[list, int]:
     for num in range(total):
         t_pag = time.time()
         try:
-            texto_bruto = doc[num].get_text("text")
+            texto_bruto = doc[num].get_text("text", sort=True)
             texto_limpo = _limpar_texto(texto_bruto)
         except Exception as e:
             print(f"          Pagina {num+1}: erro ({e}) — pulando", flush=True)
             descartadas += 1
             continue
 
-        if not texto_limpo:
-            descartadas += 1
+        qualidade = (_calcular_qualidade(texto_limpo) if texto_limpo
+                     else {"aprovado": False})
+
+        # Fallback de OCR: so quando a extracao nativa falha/e fraca
+        precisa_ocr = (not qualidade.get("aprovado")
+                       or len(texto_limpo) < CFG.OCR_MIN_CHARS)
+        if (precisa_ocr and CFG.OCR_ENABLED
+                and ocr_usadas < CFG.OCR_MAX_PAGES_POR_PDF):
+            texto_ocr = _ocr_fallback_pagina(doc[num])
+            if texto_ocr:
+                ocr_usadas += 1
+                q_ocr = _calcular_qualidade(texto_ocr)
+                if q_ocr.get("aprovado") and (not qualidade.get("aprovado")
+                                              or len(texto_ocr) > len(texto_limpo)):
+                    texto_limpo, qualidade = texto_ocr, q_ocr
+
+        if texto_limpo and qualidade.get("aprovado"):
+            paginas.append({"pagina": num + 1, "texto": texto_limpo,
+                            "qualidade": qualidade})
         else:
-            qualidade = _calcular_qualidade(texto_limpo)
-            if qualidade["aprovado"]:
-                paginas.append({"pagina": num + 1, "texto": texto_limpo,
-                                "qualidade": qualidade})
-            else:
-                descartadas += 1
+            descartadas += 1
 
         dt_pag = time.time() - t_pag
         if (num + 1) % 10 == 0 or dt_pag > 2:
@@ -285,8 +314,9 @@ def _extrair_texto(pdf_bytes: bytes) -> tuple[list, int]:
 
     doc.close()
     dt = time.time() - t0
+    extra = f", {ocr_usadas} via OCR" if ocr_usadas else ""
     print(f"        Extracao OK: {dt:.1f}s — {len(paginas)} uteis, "
-          f"{descartadas} descartadas", flush=True)
+          f"{descartadas} descartadas{extra}", flush=True)
     return paginas, total
 
 
@@ -399,7 +429,7 @@ def _gerar_embeddings_e_salvar(chunks: list, hash_md5: str, pdf_id=None,
                                 callback=None):
     modelo = get_embeddings()
     col = get_collection()
-    LOTE = 25
+    LOTE = CFG.VOYAGE_EMBEDDING_BATCH
     MAX_RETRIES = 3
     total = len(chunks)
     total_lotes = (total + LOTE - 1) // LOTE
@@ -466,6 +496,36 @@ def _gerar_embeddings_e_salvar(chunks: list, hash_md5: str, pdf_id=None,
 
 
 # =====================================================================
+# EXTRACAO ESTRUTURADA DE ATOS (Fase 1 — hibrido regex + LLM)
+# =====================================================================
+
+def _extrair_e_salvar_atos(chunks: list, hash_md5: str) -> int:
+    """Extrai atos dos chunks e grava na colecao atos (idempotente)."""
+    if not CFG.ATOS_EXTRACTION_ENABLED:
+        return 0
+    from extrator_atos import extrair_atos
+
+    col = get_db()[CFG.ATOS_COLLECTION]
+    col.delete_many({"hash_arquivo": hash_md5})  # reprocesso limpo
+
+    vistos, docs = set(), []
+    for c in chunks:
+        md = c["metadados"]
+        for ato in extrair_atos(c["texto"], md["arquivo"],
+                                md["pagina"], hash_md5):
+            chave = (ato["nome_normalizado"], ato["tipo_ato"], ato["pagina"])
+            if chave in vistos:
+                continue
+            vistos.add(chave)
+            docs.append(ato)
+
+    if docs:
+        col.insert_many(docs)
+    print(f"        Atos extraidos: {len(docs)}", flush=True)
+    return len(docs)
+
+
+# =====================================================================
 # FUNCOES PUBLICAS
 # =====================================================================
 
@@ -509,11 +569,12 @@ def processar_pdf_bytes(nome: str, data: bytes, origem: str = "upload_web",
         pdf_id = col_pdfs.find_one({"hash_md5": hash_md5})["_id"]
         _gerar_embeddings_e_salvar(chunks, hash_md5, pdf_id=pdf_id,
                                     callback=callback)
+        n_atos = _extrair_e_salvar_atos(chunks, hash_md5)
         _registrar_pdf(nome, hash_md5, gridfs_id, len(data),
                         total_pags, len(chunks), origem)
 
         return {"status": "processado", "nome": nome, "paginas": total_pags,
-                "chunks": len(chunks), "hash": hash_md5}
+                "chunks": len(chunks), "atos": n_atos, "hash": hash_md5}
 
     except Exception as e:
         col_pdfs.update_one({"hash_md5": hash_md5},
@@ -584,6 +645,63 @@ def migrar_pdfs_para_gridfs():
     print(f"\nMigracao concluida.")
 
 
+def reprocessar_base():
+    """Reprocessa, in-place, todos os PDFs da pasta que ja estao na base.
+
+    Para cada arquivo: remove os chunks antigos + o registro em 'pdfs'
+    (os atos sao limpos pelo proprio _extrair_e_salvar_atos) e reprocessa,
+    regenerando chunks/embeddings/atos com a extracao melhorada.
+    Idempotente e resumivel: pode rodar de novo com seguranca.
+    """
+    import glob
+    pasta = CFG.PDF_FOLDER
+    if not pasta or not os.path.isdir(pasta):
+        print(f"PDF_FOLDER nao existe: {pasta}")
+        return
+    pdfs = sorted(glob.glob(os.path.join(pasta, "*.pdf")))
+    total = len(pdfs)
+    col_chunks = get_collection()
+    col_pdfs = get_db()["pdfs"]
+
+    print(f"\n{'='*60}")
+    print(f"  REPROCESSAMENTO IN-PLACE — {total} PDF(s)")
+    print(f"  OCR_ENABLED={CFG.OCR_ENABLED} | provider={CFG.OCR_PROVIDER}")
+    print(f"{'='*60}\n", flush=True)
+
+    t0 = time.time()
+    ok = erros = atos_total = chunks_total = 0
+    for i, caminho in enumerate(pdfs, 1):
+        nome = os.path.basename(caminho)
+        with open(caminho, "rb") as f:
+            data = f.read()
+        hash_md5 = _hash_bytes(data)
+        col_chunks.delete_many({"hash_arquivo": hash_md5})
+        col_pdfs.delete_one({"hash_md5": hash_md5})
+        try:
+            r = processar_pdf_bytes(nome, data, origem="reprocessamento")
+            if r.get("status") == "processado":
+                ok += 1
+                chunks_total += r.get("chunks", 0)
+                atos_total += r.get("atos", 0)
+                print(f"  [{i}/{total}] {nome} — OK: "
+                      f"{r.get('chunks')} chunks, {r.get('atos')} atos",
+                      flush=True)
+            else:
+                erros += 1
+                print(f"  [{i}/{total}] {nome} — {r.get('status')}: "
+                      f"{r.get('erro','')}", flush=True)
+        except Exception as e:
+            erros += 1
+            print(f"  [{i}/{total}] {nome} — ERRO: {str(e)[:120]}", flush=True)
+
+    dt = time.time() - t0
+    print(f"\n{'='*60}")
+    print(f"  REPROCESSAMENTO CONCLUIDO em {dt:.0f}s")
+    print(f"  {ok} OK, {erros} com erro | "
+          f"{chunks_total} chunks, {atos_total} atos")
+    print(f"{'='*60}\n", flush=True)
+
+
 def limpar_banco():
     db = get_db()
     r = get_collection().delete_many({})
@@ -605,7 +723,7 @@ def testar_limpeza(caminho: str):
     print(f"  Total: {total} paginas\n")
     paginas = []
     for num in range(min(total, 5)):
-        bruto = doc[num].get_text("text")
+        bruto = doc[num].get_text("text", sort=True)
         limpo = _limpar_texto(bruto)
         q = _calcular_qualidade(limpo)
         retido = len(limpo) / max(len(bruto), 1) * 100
@@ -648,7 +766,8 @@ if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Uso:")
         print("  python processar_pdf.py arquivo.pdf")
-        print("  python processar_pdf.py --reprocessar")
+        print("  python processar_pdf.py --reprocessar       (limpa o banco)")
+        print("  python processar_pdf.py --reprocessar-base  (reprocessa in-place)")
         print("  python processar_pdf.py --migrar")
         print("  python processar_pdf.py --testar-limpeza arquivo.pdf")
         sys.exit(1)
@@ -657,6 +776,8 @@ if __name__ == "__main__":
     if flag == "--reprocessar":
         limpar_banco()
         print("Banco limpo. Execute: python monitor_pasta.py")
+    elif flag == "--reprocessar-base":
+        reprocessar_base()
     elif flag == "--migrar":
         migrar_pdfs_para_gridfs()
     elif flag == "--testar-limpeza":

@@ -16,6 +16,11 @@ from typing import Optional
 from langchain_core.tools import tool
 from config import (get_db, get_collection, get_gridfs,
                      gerar_embedding, rerancar, CFG)
+from extrator_atos import normalizar, tipo_canonico
+
+_MESES = {"janeiro": 1, "fevereiro": 2, "marco": 3, "março": 3, "abril": 4,
+          "maio": 5, "junho": 6, "julho": 7, "agosto": 8, "setembro": 9,
+          "outubro": 10, "novembro": 11, "dezembro": 12}
 
 
 # =====================================================================
@@ -263,7 +268,7 @@ def busca_rapida_paralela(consulta: str, vetor: list, limite: int = 6) -> list:
 # =====================================================================
 
 def verificar_cache(pergunta: str, vetor: list = None,
-                    limiar: float = 0.95) -> Optional[str]:
+                    limiar: float = 0.97) -> Optional[str]:
     try:
         db = get_db()
         if vetor is None:
@@ -438,11 +443,12 @@ def listar_pdfs():
 
 
 def excluir_pdf(hash_md5: str):
-    """Remove PDF: chunks + registro pdfs + GridFS."""
+    """Remove PDF: chunks + atos + registro pdfs + GridFS."""
     db = get_db()
     pdf = db["pdfs"].find_one({"hash_md5": hash_md5})
     if pdf:
         get_collection().delete_many({"hash_arquivo": hash_md5})
+        db[CFG.ATOS_COLLECTION].delete_many({"hash_arquivo": hash_md5})
         gid = pdf.get("gridfs_id")
         if gid:
             try:
@@ -555,11 +561,14 @@ def buscar_em_arquivo(nome_arquivo: str, consulta: str) -> str:
 def estatisticas_base() -> str:
     """Estatisticas da base: chunks, PDFs, lista de arquivos."""
     col = get_collection()
-    total = col.count_documents({})
-    arqs = col.distinct("metadados.arquivo")
-    s = f"ESTATISTICAS:\n- Chunks: {total:,}\n- PDFs: {len(arqs)}\n\nARQUIVOS:\n"
-    for a in sorted(arqs):
-        s += f"  - {a} ({col.count_documents({'metadados.arquivo': a})} chunks)\n"
+    grupos = list(col.aggregate([
+        {"$group": {"_id": "$metadados.arquivo", "chunks": {"$sum": 1}}},
+        {"$sort": {"_id": 1}},
+    ]))
+    total = sum(g["chunks"] for g in grupos)
+    s = f"ESTATISTICAS:\n- Chunks: {total:,}\n- PDFs: {len(grupos)}\n\nARQUIVOS:\n"
+    for g in grupos:
+        s += f"  - {g['_id']} ({g['chunks']} chunks)\n"
     return s
 
 
@@ -700,166 +709,93 @@ def busca_estruturada(nome_pessoa: str = "", tipo_ato: str = "",
     return s
 
 
+def _consultar_atos(nome_pessoa: str = "", tipo_ato: str = "", cargo: str = "",
+                    orgao: str = "", ano: str = "", mes: str = "") -> str:
+    """Nucleo da consulta de atos — contagem EXATA via colecao 'atos'."""
+    col = get_db()[CFG.ATOS_COLLECTION]
+    filtro, crit = {}, []
+
+    if nome_pessoa:
+        # \b garante correspondencia por palavra inteira: 'pedro' casa
+        # 'Pedro Silva'/'Joao Pedro' mas nao 'Pedroso'/'Pedrosa'.
+        termo = re.escape(normalizar(nome_pessoa))
+        filtro["nome_normalizado"] = {"$regex": rf"\b{termo}\b"}
+        crit.append(f"nome='{nome_pessoa}'")
+    if tipo_ato:
+        tc = tipo_canonico(tipo_ato)
+        filtro["tipo_ato"] = tc
+        crit.append(f"tipo='{tc}'")
+    if cargo:
+        filtro["cargo"] = {"$regex": re.escape(cargo), "$options": "i"}
+        crit.append(f"cargo='{cargo}'")
+    if orgao:
+        filtro["orgao"] = {"$regex": re.escape(orgao), "$options": "i"}
+        crit.append(f"orgao='{orgao}'")
+    if ano:
+        try:
+            filtro["ano"] = int(str(ano).strip())
+            crit.append(f"ano={ano}")
+        except ValueError:
+            pass
+    if mes:
+        ml = str(mes).lower().strip()
+        mv = _MESES.get(ml, int(ml) if ml.isdigit() else None)
+        if mv:
+            filtro["mes"] = mv
+            crit.append(f"mes={mv}")
+
+    s = f"CONSULTA PRECISA (colecao atos): {' AND '.join(crit) or 'sem filtros'}\n\n"
+
+    if col.estimated_document_count() == 0:
+        return s + ("Colecao 'atos' vazia. Rode o back-fill: "
+                    "python backfill_atos.py")
+
+    total_atos = col.count_documents(filtro)
+    if total_atos == 0:
+        return s + "Nenhum ato encontrado com esses criterios."
+
+    grupos = list(col.aggregate([
+        {"$match": filtro},
+        {"$group": {"_id": "$nome_normalizado",
+                    "nome": {"$first": "$nome"},
+                    "cargo": {"$first": "$cargo"},
+                    "orgao": {"$first": "$orgao"},
+                    "fontes": {"$addToSet": {"arquivo": "$arquivo",
+                                              "pagina": "$pagina"}},
+                    "ocorrencias": {"$sum": 1}}},
+        {"$sort": {"nome": 1}},
+    ]))
+
+    s += f"PESSOAS UNICAS: {len(grupos)}\nTOTAL DE ATOS: {total_atos}\n\nLISTA:\n\n"
+    for i, g in enumerate(grupos, 1):
+        l = f"{i}. **{g['nome']}**"
+        if tipo_ato:
+            l += f" — {tipo_canonico(tipo_ato)}"
+        if g.get("cargo"):
+            l += f", {g['cargo']}"
+        if g.get("orgao"):
+            l += f", {g['orgao']}"
+        fontes = g.get("fontes", [])[:3]
+        fs = "; ".join(f"{f.get('arquivo', '?')}, p.{f.get('pagina', '?')}"
+                       for f in fontes)
+        l += f" (Fonte: {fs})"
+        s += l + "\n"
+    return s
+
+
 @tool
 @_track_tempo("consultar_atos")
 def consultar_atos(nome_pessoa: str = "", tipo_ato: str = "",
                     cargo: str = "", orgao: str = "", ano: str = "",
                     mes: str = "") -> str:
-    """Consulta PRECISA com contagem EXATA de pessoas via $search + extracao em memoria.
+    """Consulta PRECISA com contagem EXATA de pessoas na colecao 'atos'.
     USE SEMPRE para contagens e listagens.
 
     EXEMPLOS:
       'quantos pedros nomeados em 2025' -> consultar_atos(nome_pessoa='pedro', tipo_ato='nomeacao', ano='2025')
       'pedro exonerado medico maio 2025' -> consultar_atos(nome_pessoa='pedro', tipo_ato='exoneracao', cargo='medico', ano='2025', mes='maio')
     """
-    col = get_collection()
-    must, crit = [], []
-
-    if nome_pessoa:
-        must.append({"compound": {"should": [
-            {"text": {"query": nome_pessoa, "path": "texto",
-                       "fuzzy": {"maxEdits": 1, "prefixLength": 1}}},
-            {"text": {"query": nome_pessoa, "path": "texto.fonetico"}},
-            {"text": {"query": nome_pessoa, "path": "texto.normalizado",
-                       "fuzzy": {"maxEdits": 1, "prefixLength": 1}}}
-        ]}})
-        crit.append(f"nome='{nome_pessoa}'")
-    if tipo_ato:
-        exp = {"nomeacao": "nomeacao nomear nomeado nomeada designar fica nomeado",
-                "exoneracao": "exoneracao exonerar exonerado dispensar a pedido",
-                "designacao": "designacao designar designado designada",
-                "dispensacao": "dispensar dispensado dispensacao"}
-        must.append({"text": {"query": exp.get(tipo_ato.lower(), tipo_ato),
-                                "path": "texto",
-                                "fuzzy": {"maxEdits": 1, "prefixLength": 1}}})
-        crit.append(f"tipo='{tipo_ato}'")
-    if cargo:
-        must.append({"compound": {"should": [
-            {"text": {"query": cargo, "path": "texto",
-                       "fuzzy": {"maxEdits": 1, "prefixLength": 1}}},
-            {"text": {"query": cargo, "path": "texto.normalizado",
-                       "fuzzy": {"maxEdits": 1, "prefixLength": 1}}}
-        ]}})
-        crit.append(f"cargo='{cargo}'")
-    if orgao:
-        must.append({"compound": {"should": [
-            {"text": {"query": orgao, "path": "texto",
-                       "fuzzy": {"maxEdits": 1, "prefixLength": 1}}},
-            {"text": {"query": orgao, "path": "texto.normalizado",
-                       "fuzzy": {"maxEdits": 1, "prefixLength": 1}}}
-        ]}})
-        crit.append(f"orgao='{orgao}'")
-    if ano:
-        must.append({"compound": {"should": [
-            {"text": {"query": ano, "path": "texto"}},
-            {"text": {"query": ano, "path": "metadados.arquivo"}}
-        ]}})
-        crit.append(f"ano={ano}")
-    if mes:
-        mn = {"janeiro": "01", "fevereiro": "02", "marco": "03", "março": "03",
-               "abril": "04", "maio": "05", "junho": "06", "julho": "07",
-               "agosto": "08", "setembro": "09", "outubro": "10",
-               "novembro": "11", "dezembro": "12"}
-        ml = mes.lower().strip()
-        t = (f"{ml} {mn[ml]}" if ml in mn else
-              (f"{mes.zfill(2)}" if mes.isdigit() else ml))
-        must.append({"compound": {"should": [
-            {"text": {"query": t, "path": "texto"}},
-            {"text": {"query": t, "path": "metadados.arquivo"}}
-        ]}})
-        crit.append(f"mes='{mes}'")
-
-    if not must:
-        return "Informe pelo menos um criterio."
-
-    sq = {"index": "busca_textual", "compound": {"must": must}}
-    s = f"CONSULTA PRECISA: {' AND '.join(crit)}\n\n"
-
-    total_t = 0
-    try:
-        cr = list(col.aggregate([
-            {"$searchMeta": {"index": "busca_textual",
-                              "count": {"type": "total"},
-                              "compound": {"must": must}}}
-        ]))
-        total_t = cr[0].get("count", {}).get("total", 0) if cr else 0
-    except Exception:
-        pass
-    s += f"Trechos encontrados: {total_t}\n\n"
-    if total_t == 0:
-        return s + "Nenhum resultado. Tente remover filtros ou usar sinonimos."
-
-    try:
-        chunks = list(col.aggregate([
-            {"$search": sq},
-            {"$project": {"texto": 1, "metadados": 1,
-                            "score": {"$meta": "searchScore"}}},
-            {"$sort": {"score": -1}}, {"$limit": 200}
-        ]))
-    except Exception as e:
-        return f"Erro: {e}"
-
-    # Extracao de nomes via regex em memoria
-    RE_NOMES = [
-        re.compile(r'(?:NOMEAR|EXONERAR|DESIGNAR|DISPENSAR)\s*,?\s*(?:a\s+pedido\s*,?\s*)?\s*([A-ZÁÉÍÓÚÃÕÂÊÔÇ][A-ZÁÉÍÓÚÃÕÂÊÔÇ\s]{6,60}?)(?:\s*,|\s+para|\s+do\s+Cargo|\s+da\s+Função|\s+matrícula)'),
-        re.compile(r'(?:nomeado|nomeada|exonerado|exonerada)\s*,?\s*([A-ZÁÉÍÓÚÃÕÂÊÔÇ][A-ZÁÉÍÓÚÃÕÂÊÔÇ\s]{6,60}?)(?:\s*,|\s+para|\s+do\s+Cargo)'),
-    ]
-    RE_LIMPA = re.compile(r'\s+(DE|DA|DO|DOS|DAS|E|PARA|A|O)\s*$')
-    RE_CARGO = re.compile(r'(?:Cargo\s+(?:em\s+Comissão|de\s+Natureza\s+Especial)|Função\s+de\s+Confiança)[,\s]+(?:Símbolo\s+)?([^,\n]{5,80})')
-    RE_ORGAO = re.compile(r'(?:da|do)\s+((?:Secretaria|Administração Regional|Subsecretaria|Diretoria|Casa Civil|Procuradoria)[^,\n\.]{5,100})')
-
-    pessoas = {}
-    for chunk in chunks:
-        txt = chunk.get("texto", "")
-        arq = chunk.get("metadados", {}).get("arquivo", "?")
-        pag = chunk.get("metadados", {}).get("pagina", "?")
-        for pat in RE_NOMES:
-            for m in pat.finditer(txt):
-                nome = RE_LIMPA.sub('', m.group(1).strip()).strip()
-                if len(nome) > 6 and " " in nome:
-                    if nome_pessoa and nome_pessoa.lower() not in nome.lower():
-                        continue
-                    chave = nome.lower()
-                    if chave not in pessoas:
-                        pos = txt.upper().find(nome)
-                        ctx = txt[max(0, pos):pos + 400]
-                        cm = RE_CARGO.search(ctx)
-                        om = RE_ORGAO.search(ctx)
-                        pessoas[chave] = {
-                            "nome": nome.title(),
-                            "cargo": cm.group(1).strip() if cm else "",
-                            "orgao": om.group(1).strip() if om else "",
-                            "fontes": []
-                        }
-                    fonte = f"{arq}, p.{pag}"
-                    if fonte not in pessoas[chave]["fontes"]:
-                        pessoas[chave]["fontes"].append(fonte)
-
-    n = len(pessoas)
-    s += f"PESSOAS UNICAS: {n}\n(analisados {len(chunks)} de {total_t} trechos)\n\n"
-    if n == 0:
-        s += "Nomes nao extraidos. Trechos para analise manual:\n\n"
-        for i, c in enumerate(chunks[:10], 1):
-            md = c.get("metadados", {})
-            s += (f"[{i}] {md.get('arquivo', '?')}, p.{md.get('pagina', '?')}\n"
-                  f"{c.get('texto', '')[:300].replace(chr(10), ' ')}\n\n")
-        return s
-
-    s += "LISTA:\n\n"
-    for i, (_, info) in enumerate(sorted(pessoas.items()), 1):
-        l = f"{i}. **{info['nome']}**"
-        if tipo_ato:
-            l += f" — {tipo_ato}"
-        if info['cargo']:
-            l += f", {info['cargo']}"
-        if info['orgao']:
-            l += f", {info['orgao']}"
-        l += f" (Fonte: {'; '.join(info['fontes'][:3])})"
-        s += l + "\n"
-
-    if total_t > len(chunks):
-        s += f"\nNOTA: Analisados {len(chunks)} de {total_t} trechos."
-    return s
+    return _consultar_atos(nome_pessoa, tipo_ato, cargo, orgao, ano, mes)
 
 
 TODAS_FERRAMENTAS = [

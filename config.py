@@ -41,13 +41,29 @@ class _Config:
     # LLMs
     LLM_MODEL = os.getenv("LLM_MODEL", "gemma4:26b")
     ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+    ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
     GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
+    GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3-pro-preview")
+    MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "")
+    MISTRAL_OCR_MODEL = os.getenv("MISTRAL_OCR_MODEL", "mistral-ocr-latest")
 
     # Processamento
     PDF_FOLDER = os.getenv("PDF_FOLDER", "")
     CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1500"))
     CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "300"))
     PDF_SERVER_PORT = int(os.getenv("PDF_SERVER_PORT", "8502"))
+
+    # Extracao estruturada de atos (Fase 1)
+    ATOS_COLLECTION = os.getenv("ATOS_COLLECTION", "atos")
+    ATOS_EXTRACTION_ENABLED = os.getenv("ATOS_EXTRACTION_ENABLED", "true").lower() == "true"
+    ATOS_LLM_ENABLED = os.getenv("ATOS_LLM_ENABLED", "true").lower() == "true"
+
+    # OCR de fallback (so para paginas que falham na extracao de texto)
+    OCR_ENABLED = os.getenv("OCR_ENABLED", "false").lower() == "true"
+    OCR_PROVIDER = os.getenv("OCR_PROVIDER", "gemini").lower()  # gemini | mistral
+    OCR_MIN_CHARS = int(os.getenv("OCR_MIN_CHARS", "120"))
+    OCR_DPI = int(os.getenv("OCR_DPI", "200"))
+    OCR_MAX_PAGES_POR_PDF = int(os.getenv("OCR_MAX_PAGES_POR_PDF", "50"))
 
 
 CFG = _Config()

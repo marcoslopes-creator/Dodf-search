@@ -9,7 +9,7 @@ Uso: python setup_mongodb.py
 
 from datetime import datetime
 from pymongo import ASCENDING
-from config import get_db
+from config import get_db, CFG
 
 
 PROMPT_AGENTE = """Voce e o assistente oficial da Casa Civil do Distrito Federal, especializado EXCLUSIVAMENTE no Diario Oficial do Distrito Federal (DODF).
@@ -132,9 +132,29 @@ def setup():
     })
     print("   Prompt v5 inserido")
 
+    # Colecao atos (extracao estruturada — Fase 1)
+    print(f"\n8. {CFG.ATOS_COLLECTION} (atos estruturados)...")
+    col = db[CFG.ATOS_COLLECTION]
+    try:
+        col.create_index([("nome_normalizado", ASCENDING),
+                           ("tipo_ato", ASCENDING), ("ano", ASCENDING)])
+        col.create_index([("tipo_ato", ASCENDING)])
+        col.create_index([("ano", ASCENDING), ("mes", ASCENDING)])
+        col.create_index([("orgao", ASCENDING)])
+        col.create_index([("arquivo", ASCENDING)])
+        col.create_index([("hash_arquivo", ASCENDING)])
+    except Exception:
+        pass
+    print(f"   {col.count_documents({})} atos registrados")
+
     # Verifica documentos
-    print("\n8. documentos...")
+    print("\n9. documentos...")
     col = db["documentos"]
+    try:
+        col.create_index([("metadados.arquivo", ASCENDING)])
+        col.create_index([("hash_arquivo", ASCENDING)])
+    except Exception:
+        pass
     print(f"   Chunks: {col.count_documents({})}")
     print(f"   PDFs distintos: {len(col.distinct('metadados.arquivo'))}")
 

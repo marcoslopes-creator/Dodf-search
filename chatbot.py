@@ -30,8 +30,11 @@ from tools_dodf import (
     consultar_auditoria, estatisticas_auditoria,
     listar_pdfs, excluir_pdf,
     reset_timings, get_timings,
+    _consultar_atos, _MESES,
 )
 from processar_pdf import processar_pdf_bytes
+from nl2query import interpretar
+from ui_theme import aplicar_tema, cabecalho, marca_sidebar
 
 
 DEFAULT_PROMPT = """Voce e um assistente do DODF. Responda em portugues. Cite fontes."""
@@ -179,7 +182,7 @@ def get_memory():
 def criar_agente_claude(_sp, _mem):
     try:
         from langchain_anthropic import ChatAnthropic
-        llm = ChatAnthropic(model="claude-sonnet-4-20250514",
+        llm = ChatAnthropic(model=CFG.ANTHROPIC_MODEL,
                              api_key=CFG.ANTHROPIC_API_KEY,
                              temperature=0.1, max_tokens=4000,
                              max_retries=5, timeout=120)
@@ -193,7 +196,7 @@ def criar_agente_claude(_sp, _mem):
 def criar_agente_gemini(_sp, _mem):
     try:
         from langchain_google_genai import ChatGoogleGenerativeAI
-        llm = ChatGoogleGenerativeAI(model="gemini-3-pro-preview",
+        llm = ChatGoogleGenerativeAI(model=CFG.GEMINI_MODEL,
                                        google_api_key=CFG.GOOGLE_API_KEY,
                                        temperature=1.0, max_output_tokens=4000,
                                        max_retries=3, timeout=120)
@@ -254,12 +257,12 @@ def invocar_llm(prompt, modelo):
     if modelo == "Claude" and CFG.ANTHROPIC_API_KEY:
         from langchain_anthropic import ChatAnthropic
         return _str_resp(ChatAnthropic(
-            model="claude-sonnet-4-20250514", api_key=CFG.ANTHROPIC_API_KEY,
+            model=CFG.ANTHROPIC_MODEL, api_key=CFG.ANTHROPIC_API_KEY,
             temperature=0.1, max_tokens=2000).invoke(prompt))
     elif modelo == "Gemini" and CFG.GOOGLE_API_KEY:
         from langchain_google_genai import ChatGoogleGenerativeAI
         return _str_resp(ChatGoogleGenerativeAI(
-            model="gemini-3-pro-preview", google_api_key=CFG.GOOGLE_API_KEY,
+            model=CFG.GEMINI_MODEL, google_api_key=CFG.GOOGLE_API_KEY,
             temperature=1.0, max_output_tokens=2000).invoke(prompt))
     else:
         return _str_resp(ChatOllama(model=CFG.LLM_MODEL,
@@ -300,6 +303,49 @@ def responder_cumprimento(t):
     return "Ola! Sou o assistente da Casa Civil do DF. Qual sua pergunta?"
 
 
+# =====================================================================
+# ROTEAMENTO DE CONTAGEM/LISTAGEM -> consultar_atos (Modo Rapido)
+# =====================================================================
+
+_RE_ANO = re.compile(r"(19|20)\d{2}")
+_GATILHO_TIPO = {
+    "nomea": "nomeacao", "nomead": "nomeacao",
+    "exoner": "exoneracao",
+    "design": "designacao",
+    "dispens": "dispensacao",
+}
+_INTENCAO_CONTAGEM = ("quant", "liste", "listar", "relacion", "todos os",
+                      "todas as", "quais ", "quem foi", "quem foram")
+
+
+def _eh_contagem_atos(pergunta: str) -> bool:
+    """True se a pergunta pede contagem/listagem de atos de pessoal."""
+    p = pergunta.lower()
+    tem_intencao = any(k in p for k in _INTENCAO_CONTAGEM)
+    tem_gatilho = any(g in p for g in _GATILHO_TIPO)
+    return tem_intencao and tem_gatilho
+
+
+def _filtros_atos(pergunta: str) -> dict:
+    """Extrai tipo_ato, ano e mes da pergunta (heuristica deterministica)."""
+    p = pergunta.lower()
+    tipo = ""
+    for gat, tc in _GATILHO_TIPO.items():
+        if gat in p:
+            tipo = tc
+            break
+    ano = ""
+    m = _RE_ANO.search(p)
+    if m:
+        ano = m.group(0)
+    mes = ""
+    for nome_mes in _MESES:
+        if nome_mes in p:
+            mes = nome_mes
+            break
+    return {"tipo_ato": tipo, "ano": ano, "mes": mes}
+
+
 def pipeline_rapido(pergunta, hist, usar_cache, modelo):
     if eh_cumprimento(pergunta):
         return responder_cumprimento(pergunta), [], False, []
@@ -319,6 +365,27 @@ def pipeline_rapido(pergunta, hist, usar_cache, modelo):
                                "tempo_ms": ms_cache, "sucesso": True})
         if rc:
             return rc, [], True, []
+
+    # Roteamento analitico: pergunta de contagem/listagem -> query estruturada.
+    # Gatilho barato (palavra de ato) evita custo de LLM em perguntas comuns;
+    # com gatilho, o interpretador LLM extrai os filtros (inclusive o nome).
+    if CFG.ATOS_EXTRACTION_ENABLED and any(g in pergunta.lower()
+                                           for g in _GATILHO_TIPO):
+        filtros = interpretar(pergunta)
+        if filtros is None and _eh_contagem_atos(pergunta):
+            filtros = _filtros_atos(pergunta)  # fallback sem LLM
+        if filtros:
+            params = {k: filtros.get(k, "") for k in
+                      ("nome_pessoa", "tipo_ato", "cargo", "orgao", "ano", "mes")}
+            t0 = time.time()
+            resp = _consultar_atos(**params)
+            ms_atos = int((time.time() - t0) * 1000)
+            _timings_atual.append({"ferramenta": "consulta_analitica",
+                                   "tempo_ms": ms_atos, "sucesso": True})
+            salvar_cache(pergunta, resp, ["consulta_analitica"], modelo,
+                         vetor=vetor)
+            return resp, [{"ferramenta": "consulta_analitica",
+                           "parametros": params}], False, []
 
     res = busca_rapida_paralela(pergunta, vetor, limite=6)
 
@@ -362,16 +429,13 @@ def ts_fmt(ts):
 # =====================================================================
 
 def pagina_busca():
-    st.markdown("### 🏛️ Casa Civil do Distrito Federal")
-    st.caption("Busca Textual Direta — sem IA")
-    st.divider()
+    cabecalho("Busca Textual no Diário Oficial",
+              "Busca direta — fuzzy, fonética e stemming (sem IA)")
     consulta = st.text_input("🔍 Buscar no Diário Oficial:",
                               placeholder="Ex: Ibaneis Rocha, nomeação secretário...")
 
     with st.sidebar:
-        st.markdown("### 🏛️ Casa Civil do DF")
-        st.caption("Busca Textual")
-        st.divider()
+        marca_sidebar("Busca Textual")
         max_r = st.slider("Máx resultados:", 5, 50, 20)
         st.divider()
         st.caption("✅ Fuzzy | ✅ Fonético | ✅ Normalização | ✅ Stemming | ✅ Highlights")
@@ -440,14 +504,11 @@ def pagina_busca():
 # =====================================================================
 
 def pagina_chat():
-    st.markdown("### 🏛️ Casa Civil do Distrito Federal")
-    st.caption("Assistente Inteligente do Diário Oficial do DF")
-    st.divider()
+    cabecalho("Assistente Inteligente do DODF",
+              "Pergunte sobre decretos, portarias, nomeações e mais")
 
     with st.sidebar:
-        st.markdown("### 🏛️ Casa Civil do DF")
-        st.caption("Assistente DODF")
-        st.divider()
+        marca_sidebar("Assistente DODF")
 
         ops, mp = [], {}
         if CFG.ANTHROPIC_API_KEY:
@@ -655,14 +716,11 @@ def pagina_chat():
 # =====================================================================
 
 def pagina_upload():
-    st.markdown("### 🏛️ Casa Civil do Distrito Federal")
-    st.caption("Upload e Gestão de PDFs")
-    st.divider()
+    cabecalho("Upload e Gestão de PDFs",
+              "Envie e indexe novos documentos do Diário Oficial")
 
     with st.sidebar:
-        st.markdown("### 🏛️ Casa Civil do DF")
-        st.caption("Gestão de PDFs")
-        st.divider()
+        marca_sidebar("Gestão de PDFs")
         st.caption(f"Embedding: {CFG.VOYAGE_EMBEDDING_MODEL}")
         st.caption(f"Dimensão: {CFG.VOYAGE_EMBEDDING_DIMENSION}d")
 
@@ -749,9 +807,8 @@ def pagina_upload():
 # =====================================================================
 
 def pagina_auditoria():
-    st.markdown("### 🏛️ Casa Civil do Distrito Federal")
-    st.caption("Auditoria de Consultas")
-    st.divider()
+    cabecalho("Auditoria de Consultas",
+              "Métricas de uso, performance e feedback")
 
     c1, c2, c3, c4 = st.columns(4)
     with c1:
@@ -825,6 +882,7 @@ def pagina_auditoria():
 def main():
     st.set_page_config(page_title="Casa Civil DF - DODF",
                         page_icon="🏛️", layout="wide")
+    aplicar_tema()
     iniciar_servidor_pdf()
 
     pag = st.sidebar.radio("Navegação",
