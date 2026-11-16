@@ -13,7 +13,7 @@ import json
 import unicodedata
 from datetime import datetime
 
-from config import CFG
+from config import CFG, criar_claude
 
 
 # =====================================================================
@@ -128,7 +128,7 @@ def extrair_atos(texto, arquivo, pagina, hash_arq) -> list:
     """Hibrido: regex; LLM apenas se ha gatilho mas regex falhou."""
     atos = extrair_regex(texto, arquivo, pagina, hash_arq)
     if (not atos and _TRIGGER.search(texto)
-            and CFG.ATOS_LLM_ENABLED and CFG.ANTHROPIC_API_KEY):
+            and CFG.ATOS_LLM_ENABLED and CFG.CLAUDE_DISPONIVEL):
         atos = extrair_llm(texto, arquivo, pagina, hash_arq)
     return atos
 
@@ -161,10 +161,7 @@ def _parse_json_lista(conteudo: str) -> list:
 def extrair_llm(texto, arquivo, pagina, hash_arq) -> list:
     """Extracao via Claude — tolerante a falhas (retorna [] em qualquer erro)."""
     try:
-        from langchain_anthropic import ChatAnthropic
-        llm = ChatAnthropic(model=CFG.ANTHROPIC_MODEL,
-                            api_key=CFG.ANTHROPIC_API_KEY,
-                            temperature=0, max_tokens=1500, timeout=60)
+        llm = criar_claude(temperature=0, max_tokens=1500, timeout=60)
         resp = llm.invoke(_PROMPT_LLM + texto[:4000])
         conteudo = resp.content if hasattr(resp, "content") else str(resp)
         if isinstance(conteudo, list):

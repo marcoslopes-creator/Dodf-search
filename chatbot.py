@@ -19,9 +19,9 @@ from langchain_core.messages import HumanMessage, AIMessage
 from langchain_ollama import ChatOllama
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import MemorySaver
-from config import get_db, get_gridfs, gerar_embedding, CFG
+from config import get_db, get_gridfs, criar_claude, CFG
 from tools_dodf import (
-    TODAS_FERRAMENTAS, busca_rapida_paralela,
+    TODAS_FERRAMENTAS, busca_rapida_paralela, extrair_filtros,
     busca_textual_direta, busca_textual_contagem,
     verificar_cache, salvar_cache, registrar_metrica,
     salvar_feedback, carregar_prompt,
@@ -33,8 +33,8 @@ from tools_dodf import (
     _consultar_atos, _MESES,
 )
 from processar_pdf import processar_pdf_bytes
-from nl2query import interpretar
-from ui_theme import aplicar_tema, cabecalho, marca_sidebar
+from nl2query import interpretar, InterpretadorIndisponivel
+from ui_theme import aplicar_tema, cabecalho, marca_sidebar, marca_app
 
 
 DEFAULT_PROMPT = """Voce e um assistente do DODF. Responda em portugues. Cite fontes."""
@@ -181,11 +181,8 @@ def get_memory():
 @st.cache_resource
 def criar_agente_claude(_sp, _mem):
     try:
-        from langchain_anthropic import ChatAnthropic
-        llm = ChatAnthropic(model=CFG.ANTHROPIC_MODEL,
-                             api_key=CFG.ANTHROPIC_API_KEY,
-                             temperature=0.1, max_tokens=4000,
-                             max_retries=5, timeout=120)
+        llm = criar_claude(temperature=0.1, max_tokens=4000,
+                           max_retries=5, timeout=120)
         return create_react_agent(model=llm, tools=TODAS_FERRAMENTAS,
                                     prompt=_sp, checkpointer=_mem)
     except Exception:
@@ -254,11 +251,9 @@ def extrair_ferramentas(res):
 
 
 def invocar_llm(prompt, modelo):
-    if modelo == "Claude" and CFG.ANTHROPIC_API_KEY:
-        from langchain_anthropic import ChatAnthropic
-        return _str_resp(ChatAnthropic(
-            model=CFG.ANTHROPIC_MODEL, api_key=CFG.ANTHROPIC_API_KEY,
-            temperature=0.1, max_tokens=2000).invoke(prompt))
+    if modelo == "Claude" and CFG.CLAUDE_DISPONIVEL:
+        return _str_resp(criar_claude(temperature=0.1, max_tokens=2000)
+                         .invoke(prompt))
     elif modelo == "Gemini" and CFG.GOOGLE_API_KEY:
         from langchain_google_genai import ChatGoogleGenerativeAI
         return _str_resp(ChatGoogleGenerativeAI(
@@ -350,16 +345,13 @@ def pipeline_rapido(pergunta, hist, usar_cache, modelo):
     if eh_cumprimento(pergunta):
         return responder_cumprimento(pergunta), [], False, []
 
-    t0 = time.time()
-    vetor = gerar_embedding(pergunta)
-    ms_emb = int((time.time() - t0) * 1000)
+    # Embeddings da pergunta sao gerados pelo Atlas (autoEmbed) dentro do
+    # $vectorSearch — nao ha chamada previa a API de embeddings.
     from tools_dodf import _timings_atual
-    _timings_atual.append({"ferramenta": "embedding_query",
-                           "tempo_ms": ms_emb, "sucesso": True})
 
     if usar_cache:
         t0 = time.time()
-        rc = verificar_cache(pergunta, vetor=vetor)
+        rc = verificar_cache(pergunta)
         ms_cache = int((time.time() - t0) * 1000)
         _timings_atual.append({"ferramenta": "cache_semantico",
                                "tempo_ms": ms_cache, "sucesso": True})
@@ -369,11 +361,27 @@ def pipeline_rapido(pergunta, hist, usar_cache, modelo):
     # Roteamento analitico: pergunta de contagem/listagem -> query estruturada.
     # Gatilho barato (palavra de ato) evita custo de LLM em perguntas comuns;
     # com gatilho, o interpretador LLM extrai os filtros (inclusive o nome).
+    aviso = ""
     if CFG.ATOS_EXTRACTION_ENABLED and any(g in pergunta.lower()
                                            for g in _GATILHO_TIPO):
-        filtros = interpretar(pergunta)
-        if filtros is None and _eh_contagem_atos(pergunta):
-            filtros = _filtros_atos(pergunta)  # fallback sem LLM
+        t0 = time.time()
+        try:
+            filtros = interpretar(pergunta)
+            _timings_atual.append({"ferramenta": "interpretador_nl2query",
+                                   "tempo_ms": int((time.time() - t0) * 1000),
+                                   "sucesso": True})
+            if filtros is None and _eh_contagem_atos(pergunta):
+                filtros = _filtros_atos(pergunta)  # fallback sem LLM
+        except InterpretadorIndisponivel as e:
+            # Sem LLM nao da para extrair nome/cargo/orgao; o fallback
+            # heuristico (so tipo/ano/mes) responderia a uma pergunta mais
+            # ampla do que a feita. Segue para a busca hibrida.
+            _timings_atual.append({"ferramenta": "interpretador_nl2query",
+                                   "tempo_ms": int((time.time() - t0) * 1000),
+                                   "sucesso": False, "erro": str(e)[:200]})
+            filtros = None
+            aviso = ("\n\n_Interpretador analitico indisponivel "
+                     f"({str(e)[:80]}); resposta baseada em busca nos trechos._")
         if filtros:
             params = {k: filtros.get(k, "") for k in
                       ("nome_pessoa", "tipo_ato", "cargo", "orgao", "ano", "mes")}
@@ -382,18 +390,23 @@ def pipeline_rapido(pergunta, hist, usar_cache, modelo):
             ms_atos = int((time.time() - t0) * 1000)
             _timings_atual.append({"ferramenta": "consulta_analitica",
                                    "tempo_ms": ms_atos, "sucesso": True})
-            salvar_cache(pergunta, resp, ["consulta_analitica"], modelo,
-                         vetor=vetor)
+            salvar_cache(pergunta, resp, ["consulta_analitica"], modelo)
             return resp, [{"ferramenta": "consulta_analitica",
                            "parametros": params}], False, []
 
-    res = busca_rapida_paralela(pergunta, vetor, limite=6)
+    filtros = extrair_filtros(pergunta)
+    params_busca = {"consulta": pergunta}
+    if filtros:
+        params_busca["prefiltro"] = filtros["descricao"]
+    res = busca_rapida_paralela(pergunta, limite=6, filtros=filtros)
 
     if not res:
         r = "Nao encontrei resultados no DODF."
-        salvar_cache(pergunta, r, [], modelo, vetor=vetor)
+        if filtros:
+            r += f" (recorte aplicado: {filtros['descricao']})"
+        salvar_cache(pergunta, r, [], modelo)
         return r, [{"ferramenta": "busca_rapida_paralela",
-                     "parametros": {"consulta": pergunta}}], False, []
+                     "parametros": params_busca}], False, []
 
     ctx = ""
     for i, r in enumerate(res, 1):
@@ -415,9 +428,11 @@ def pipeline_rapido(pergunta, hist, usar_cache, modelo):
                                "tempo_ms": ms_llm, "sucesso": True})
     except Exception as e:
         resp = f"Erro: {e}"
-    salvar_cache(pergunta, resp, ["busca_rapida_paralela"], modelo, vetor=vetor)
+    resp += aviso
+    if not resp.startswith("Erro:"):
+        salvar_cache(pergunta, resp, ["busca_rapida_paralela"], modelo)
     return resp, [{"ferramenta": "busca_rapida_paralela",
-                   "parametros": {"consulta": pergunta}}], False, res
+                   "parametros": params_busca}], False, res
 
 
 def ts_fmt(ts):
@@ -511,9 +526,10 @@ def pagina_chat():
         marca_sidebar("Assistente DODF")
 
         ops, mp = [], {}
-        if CFG.ANTHROPIC_API_KEY:
-            ops.append("Claude (Anthropic)")
-            mp["Claude (Anthropic)"] = "Claude"
+        if CFG.CLAUDE_DISPONIVEL:
+            rot = f"Claude ({CFG.CLAUDE_PROVEDOR})"
+            ops.append(rot)
+            mp[rot] = "Claude"
         if CFG.GOOGLE_API_KEY:
             ops.append("Gemini 3 Pro (Google)")
             mp["Gemini 3 Pro (Google)"] = "Gemini"
@@ -721,8 +737,9 @@ def pagina_upload():
 
     with st.sidebar:
         marca_sidebar("Gestão de PDFs")
-        st.caption(f"Embedding: {CFG.VOYAGE_EMBEDDING_MODEL}")
-        st.caption(f"Dimensão: {CFG.VOYAGE_EMBEDDING_DIMENSION}d")
+        st.caption(f"Embedding (Atlas autoEmbed): {CFG.VOYAGE_EMBEDDING_MODEL}")
+        st.caption(f"Consultas: {CFG.VOYAGE_QUERY_MODEL} · "
+                   f"{CFG.VOYAGE_EMBEDDING_DIMENSION}d")
 
     st.subheader("📤 Enviar novos PDFs")
     arquivos = st.file_uploader("Arraste PDFs aqui:", type=["pdf"],
@@ -883,6 +900,7 @@ def main():
     st.set_page_config(page_title="Casa Civil DF - DODF",
                         page_icon="🏛️", layout="wide")
     aplicar_tema()
+    marca_app()
     iniciar_servidor_pdf()
 
     pag = st.sidebar.radio("Navegação",

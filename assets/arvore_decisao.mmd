@@ -1,0 +1,57 @@
+flowchart TD
+    START(["Entrada no sistema"]) --> Q1{"Tipo de<br/>entrada?"}
+
+    %% ===== RAMO INGESTAO =====
+    Q1 -->|"PDF novo"| ING["Ingestao paralela<br/>ProcessPoolExecutor · resumivel (V2 #1)"]
+    ING --> EXT["Extrair texto<br/>sort=True + limpeza de invisiveis"]
+    EXT --> D_OCR{"Pagina com texto<br/>suficiente?<br/>(>= OCR_MIN_CHARS)"}
+    D_OCR -->|"Nao"| OCR["OCR fallback<br/>Gemini"]
+    D_OCR -->|"Sim"| EMB
+    OCR --> EMB["Gerar embeddings em lote<br/>Voyage"]
+    EMB --> D_RGX{"Regex achou<br/>um ato?"}
+    D_RGX -->|"Sim"| ATO_R["Grava ato<br/>metodo = regex"]
+    D_RGX -->|"Nao"| D_GAT{"Tem gatilho<br/>de ato?"}
+    D_GAT -->|"Sim"| LLM_R["Reforco via LLM (V2 #4)<br/>passada resumivel · upsert idempotente"]
+    D_GAT -->|"Nao"| CHUNK["Somente chunk<br/>(sem ato)"]
+    LLM_R --> ATO_L["Grava ato<br/>metodo = llm"]
+    ATO_R --> STORE
+    ATO_L --> STORE
+    CHUNK --> STORE
+    STORE[("MongoDB Atlas<br/>documentos + atos<br/>indice vetorial quantizado (V2 #2)")]
+
+    %% ===== RAMO CONSULTA =====
+    Q1 -->|"Pergunta"| POOL["Conexao via pool<br/>MongoClient max=100 (V2 #3)"]
+    POOL --> D_CACHE{"Cache semantico?<br/>score >= CACHE_SIMILARITY"}
+    D_CACHE -->|"Hit"| RESP_C["Resposta do cache<br/>(~instantanea)"]
+    D_CACHE -->|"Miss"| NL2Q["nl2query<br/>interpreta a pergunta -> JSON"]
+    NL2Q --> D_ANALIT{"Pergunta analitica<br/>ou de contagem?"}
+
+    D_ANALIT -->|"Sim"| CONS["consultar_atos<br/>agregacao exata na colecao atos"]
+    CONS --> RESP_A["Resposta estruturada<br/>(contagem/listagem exata)"]
+
+    D_ANALIT -->|"Nao"| BUSCA["busca_rapida_paralela<br/>textual + vetorial em paralelo"]
+    BUSCA --> D_RERANK{"melhor score semantico<br/>>= RERANK_SKIP_SCORE?"}
+    D_RERANK -->|"Sim (vencedor claro)"| SKIP["Pula rerank<br/>(-1 chamada de API)"]
+    D_RERANK -->|"Nao"| RERANK["Rerank Voyage<br/>rerank-2.5"]
+    SKIP --> GEN
+    RERANK --> GEN["LLM gera resposta<br/>citando fontes"]
+    GEN --> RESP_S["Resposta semantica"]
+
+    RESP_A --> SAVE
+    RESP_S --> SAVE
+    SAVE["Salva cache + registra metricas"]
+
+    STORE -. "base consultada" .-> BUSCA
+    STORE -. "base consultada" .-> CONS
+
+    classDef start fill:#00684A,stroke:#00382a,color:#ffffff,font-weight:bold;
+    classDef decision fill:#FFE9A8,stroke:#B8860B,color:#3d2c00;
+    classDef process fill:#E8F1EF,stroke:#5A7D75,color:#0b2b24;
+    classDef mongo fill:#00ED64,stroke:#00684A,color:#001E2B,font-weight:bold;
+    classDef done fill:#CBE9DB,stroke:#00684A,color:#00251a,font-weight:bold;
+
+    class START start;
+    class Q1,D_OCR,D_RGX,D_GAT,D_CACHE,D_ANALIT,D_RERANK decision;
+    class ING,EXT,OCR,EMB,ATO_R,ATO_L,CHUNK,LLM_R,POOL,NL2Q,CONS,BUSCA,SKIP,RERANK,GEN process;
+    class STORE mongo;
+    class RESP_C,RESP_A,RESP_S,SAVE done;

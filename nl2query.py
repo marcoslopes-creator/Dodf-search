@@ -8,13 +8,19 @@ _consultar_atos monta e executa a agregacao de forma deterministica.
 
 Saida de interpretar(): dict com as chaves aceitas por _consultar_atos
 (nome_pessoa, tipo_ato, cargo, orgao, ano, mes) + 'operacao', ou None
-quando a pergunta nao e analitica.
+quando a pergunta nao e analitica. Levanta InterpretadorIndisponivel se
+nenhum LLM respondeu (sem credencial, erro de rede/gateway), para que o
+chamador nao confunda "LLM fora" com "pergunta nao analitica".
 """
 
 import json
 
-from config import CFG
+from config import CFG, criar_claude
 from extrator_atos import tipo_canonico
+
+
+class InterpretadorIndisponivel(Exception):
+    """Nenhum LLM conseguiu interpretar a pergunta."""
 
 _PROMPT = (
     "Voce converte perguntas sobre o Diario Oficial (DODF) em filtros JSON "
@@ -56,14 +62,12 @@ def _texto_resposta(resp) -> str:
 
 
 def _chamar_llm(pergunta: str) -> str:
-    """Chama Claude (preferencial) ou Gemini. Retorna '' se indisponivel."""
+    """Chama Claude (preferencial) ou Gemini. Levanta InterpretadorIndisponivel
+    se nao ha credencial ou se a chamada falhar."""
     prompt = _PROMPT + pergunta
     try:
-        if CFG.ANTHROPIC_API_KEY:
-            from langchain_anthropic import ChatAnthropic
-            llm = ChatAnthropic(model=CFG.ANTHROPIC_MODEL,
-                                api_key=CFG.ANTHROPIC_API_KEY,
-                                temperature=0, max_tokens=400, timeout=30)
+        if CFG.CLAUDE_DISPONIVEL:
+            llm = criar_claude(temperature=0, max_tokens=400, timeout=30)
             return _texto_resposta(llm.invoke(prompt))
         if CFG.GOOGLE_API_KEY:
             from langchain_google_genai import ChatGoogleGenerativeAI
@@ -72,9 +76,9 @@ def _chamar_llm(pergunta: str) -> str:
                                          temperature=0, max_output_tokens=400,
                                          timeout=30)
             return _texto_resposta(llm.invoke(prompt))
-    except Exception:
-        return ""
-    return ""
+    except Exception as e:
+        raise InterpretadorIndisponivel(f"{type(e).__name__}: {str(e)[:200]}") from e
+    raise InterpretadorIndisponivel("nenhuma credencial de LLM configurada")
 
 
 def _parse_json_obj(conteudo: str) -> dict:
@@ -115,7 +119,8 @@ def _normalizar(d: dict) -> dict:
 
 
 def interpretar(pergunta: str) -> dict:
-    """Retorna filtros estruturados ou None se a pergunta nao for analitica."""
+    """Retorna filtros estruturados ou None se a pergunta nao for analitica.
+    Levanta InterpretadorIndisponivel quando o LLM nao pode ser consultado."""
     if not pergunta or not pergunta.strip():
         return None
     dados = _parse_json_obj(_chamar_llm(pergunta))

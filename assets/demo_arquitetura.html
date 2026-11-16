@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DODF Search — Arquitetura da Solução</title>
+<style>
+  :root{
+    --verde:#00ED64; --verde-esc:#00684A; --slate:#001E2B; --slate2:#023430;
+    --cinza:#F6F8F7; --borda:#D6DEDB; --texto:#0B2B24; --suave:#5A7D75;
+    --azul:#3B6BA5; --azul-bg:#EAF3FF; --amarelo:#B8860B; --amarelo-bg:#FFF3D6;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+       background:var(--cinza);color:var(--texto);line-height:1.5}
+
+  /* ---------- cabecalho co-branded ---------- */
+  header{background:linear-gradient(105deg,var(--slate) 0%,var(--slate2) 60%,var(--verde-esc) 100%);
+         color:#fff;padding:18px 28px;display:flex;align-items:center;gap:20px;flex-wrap:wrap}
+  header img.brasao{height:54px}
+  header img.mdb{height:26px}
+  .titulo{flex:1;min-width:260px}
+  .titulo h1{margin:0;font-size:1.45rem;letter-spacing:.2px}
+  .titulo p{margin:2px 0 0;font-size:.85rem;opacity:.85}
+  .selo{background:rgba(0,237,100,.15);border:1px solid var(--verde);color:var(--verde);
+        padding:3px 10px;border-radius:20px;font-size:.72rem;font-weight:700;letter-spacing:.5px}
+
+  /* ---------- navegacao de abas ---------- */
+  nav{display:flex;gap:4px;background:#fff;border-bottom:1px solid var(--borda);
+      padding:0 28px;overflow-x:auto}
+  nav button{background:none;border:none;border-bottom:3px solid transparent;padding:13px 18px;
+             font-size:.9rem;font-weight:600;color:var(--suave);cursor:pointer;white-space:nowrap}
+  nav button:hover{color:var(--verde-esc)}
+  nav button.on{color:var(--slate);border-bottom-color:var(--verde)}
+
+  main{padding:22px 28px 60px;max-width:1500px;margin:0 auto}
+  .aba{display:none} .aba.on{display:block}
+  h2.sec{font-size:1.1rem;margin:0 0 4px;color:var(--slate)}
+  p.sub{margin:0 0 18px;color:var(--suave);font-size:.88rem}
+
+  /* ---------- caixas do diagrama ---------- */
+  .camada{background:#fff;border:1px solid var(--borda);border-radius:12px;padding:14px 16px;margin-bottom:14px}
+  .camada > h3{margin:0 0 12px;font-size:.78rem;text-transform:uppercase;letter-spacing:1px;color:var(--suave)}
+  .linha{display:flex;gap:12px;flex-wrap:wrap}
+  .cx{flex:1;min-width:150px;border:1.5px solid var(--borda);border-radius:10px;padding:11px 13px;
+      background:#fff;transition:all .35s ease;position:relative}
+  .cx b{display:block;font-size:.85rem;margin-bottom:3px}
+  .cx span{font-size:.74rem;color:var(--suave);display:block}
+  .cx.ui{background:#E8F1EF;border-color:var(--suave)}
+  .cx.app{background:var(--azul-bg);border-color:var(--azul)}
+  .cx.ia{background:var(--amarelo-bg);border-color:var(--amarelo)}
+  .cx.db{background:#CBE9DB;border-color:var(--verde-esc)}
+  .cx.idx{background:var(--verde);border-color:var(--verde-esc);color:var(--slate);font-weight:600}
+  .cx.idx span{color:#024}
+  /* destaque do passo ativo */
+  .cx.ativo{transform:translateY(-3px) scale(1.03);border-color:var(--verde-esc);border-width:2.5px;
+            box-shadow:0 0 0 4px rgba(0,237,100,.35),0 8px 18px rgba(0,0,0,.13);z-index:3}
+  .cx.apagado{opacity:.32;filter:grayscale(.5)}
+  .seta{align-self:center;color:var(--verde-esc);font-size:1.3rem;font-weight:700;flex:0 0 auto}
+
+  /* ---------- player de passos ---------- */
+  .player{background:var(--slate);color:#fff;border-radius:12px;padding:16px 18px;margin-bottom:16px;
+          display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap}
+  .player .num{background:var(--verde);color:var(--slate);width:42px;height:42px;border-radius:50%;
+                display:flex;align-items:center;justify-content:center;font-weight:800;font-size:1.1rem;flex:0 0 auto}
+  .player .txt{flex:1;min-width:280px}
+  .player .txt h4{margin:0 0 4px;font-size:1rem;color:var(--verde)}
+  .player .txt p{margin:0;font-size:.86rem;opacity:.92}
+  .player .txt code{background:rgba(255,255,255,.14);padding:1px 6px;border-radius:4px;font-size:.8rem}
+  .ctrl{display:flex;gap:8px;align-items:center;flex:0 0 auto}
+  .ctrl button{background:var(--verde);color:var(--slate);border:none;padding:8px 15px;border-radius:8px;
+               font-weight:700;cursor:pointer;font-size:.84rem}
+  .ctrl button.sec2{background:transparent;color:#fff;border:1px solid rgba(255,255,255,.4)}
+  .ctrl button:disabled{opacity:.35;cursor:default}
+  .passos-mini{display:flex;gap:5px;flex-wrap:wrap;margin-bottom:16px}
+  .passos-mini i{width:26px;height:6px;border-radius:3px;background:var(--borda);cursor:pointer}
+  .passos-mini i.on{background:var(--verde-esc)}
+
+  /* ---------- decisao ---------- */
+  .dec{background:var(--amarelo-bg);border:1.5px dashed var(--amarelo);border-radius:10px;
+       padding:10px 13px;font-size:.8rem;color:#3d2c00}
+  .dec b{display:block;margin-bottom:3px;font-size:.84rem}
+
+  /* ---------- tabelas e cards ---------- */
+  table{width:100%;border-collapse:collapse;background:#fff;border-radius:10px;overflow:hidden;
+        border:1px solid var(--borda);font-size:.86rem}
+  th{background:var(--slate);color:#fff;text-align:left;padding:9px 12px;font-size:.78rem;
+     text-transform:uppercase;letter-spacing:.5px}
+  td{padding:9px 12px;border-top:1px solid var(--borda)}
+  tr:hover td{background:#F2FBF6}
+  .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(165px,1fr));gap:12px;margin-bottom:18px}
+  .kpi{background:#fff;border:1px solid var(--borda);border-left:4px solid var(--verde);
+       border-radius:10px;padding:13px 15px}
+  .kpi b{display:block;font-size:1.5rem;color:var(--slate)}
+  .kpi span{font-size:.76rem;color:var(--suave)}
+  .nota{background:#fff;border-left:4px solid var(--azul);border-radius:8px;padding:11px 14px;
+        font-size:.84rem;margin:14px 0}
+  .tag{display:inline-block;background:var(--verde);color:var(--slate);font-size:.68rem;font-weight:700;
+       padding:2px 7px;border-radius:5px;margin-left:6px;vertical-align:middle}
+  footer{text-align:center;padding:20px;color:var(--suave);font-size:.78rem}
+  .img-wrap{background:#fff;border:1px solid var(--borda);border-radius:12px;padding:14px;text-align:center}
+  .img-wrap img{max-width:100%;height:auto}
+  @media print{nav,.ctrl,.passos-mini{display:none} .aba{display:block!important;page-break-after:always}}
+</style>
+</head>
+<body>
+
+<header>
+  <img class="brasao" src="df_brasao.svg" alt="Brasão do Distrito Federal">
+  <div class="titulo">
+    <h1>DODF Search — Arquitetura da Solução</h1>
+    <p>Busca inteligente no Diário Oficial do Distrito Federal · Casa Civil DF + MongoDB Atlas</p>
+  </div>
+  <span class="selo">VERSÃO 2</span>
+  <img class="mdb" src="mongodb_logo_white.svg" alt="MongoDB">
+</header>
+
+<nav>
+  <button class="on" data-aba="visao">🗺️ Visão Geral</button>
+  <button data-aba="ingestao">📥 Ciclo 1 — Ingestão do PDF</button>
+  <button data-aba="consulta">💬 Ciclo 2 — Pergunta e Resposta</button>
+  <button data-aba="numeros">📊 Números Reais</button>
+  <button data-aba="diagramas">🧩 Diagramas Técnicos</button>
+</nav>
+
+<main>
+
+<!-- ================= ABA 1 — VISAO GERAL ================= -->
+<section class="aba on" id="aba-visao">
+  <h2 class="sec">Visão geral em 4 camadas</h2>
+  <p class="sub">Todo o sistema se organiza em quatro camadas. Os dois ciclos de vida — ingestão de um PDF
+     e resposta a uma pergunta — atravessam essas mesmas camadas em sentidos diferentes.</p>
+
+  <div class="camada">
+    <h3>1 · Camada de Apresentação — Streamlit</h3>
+    <div class="linha">
+      <div class="cx ui"><b>💬 Chat com IA</b><span>pergunta em linguagem natural</span></div>
+      <div class="cx ui"><b>🔍 Busca Textual</b><span>busca direta, sem LLM</span></div>
+      <div class="cx ui"><b>📤 Upload de PDFs</b><span>ingestão manual</span></div>
+      <div class="cx ui"><b>📋 Auditoria</b><span>métricas e rastreabilidade</span></div>
+    </div>
+  </div>
+
+  <div class="camada">
+    <h3>2 · Camada de Aplicação — Python</h3>
+    <div class="linha">
+      <div class="cx app"><b>ingestao_paralela.py</b><span>vários PDFs ao mesmo tempo <span class="tag">V2 #1</span></span></div>
+      <div class="cx app"><b>processar_pdf.py</b><span>extrai texto, limpa e divide em chunks</span></div>
+      <div class="cx app"><b>extrator_atos.py</b><span>regex + LLM: transforma texto em dado estruturado</span></div>
+      <div class="cx app"><b>nl2query.py</b><span>traduz a pergunta em filtros de banco</span></div>
+      <div class="cx app"><b>tools_dodf.py</b><span>busca paralela, cache, rerank, métricas</span></div>
+    </div>
+  </div>
+
+  <div class="camada">
+    <h3>3 · Serviços de IA (externos)</h3>
+    <div class="linha">
+      <div class="cx ia"><b>Voyage AI</b><span>embeddings 1024d + rerank-2.5</span></div>
+      <div class="cx ia"><b>Anthropic Claude</b><span>gera a resposta e reforça a extração</span></div>
+      <div class="cx ia"><b>Google Gemini</b><span>OCR de páginas sem texto</span></div>
+    </div>
+  </div>
+
+  <div class="camada">
+    <h3>4 · Camada de Dados — MongoDB Atlas</h3>
+    <div class="linha">
+      <div class="cx db"><b>documentos</b><span>chunks + vetor de embedding</span></div>
+      <div class="cx db"><b>atos</b><span>nomeações, exonerações — estruturado</span></div>
+      <div class="cx db"><b>cache_semantico</b><span>respostas já dadas</span></div>
+      <div class="cx db"><b>métricas / auditoria</b><span>tempo, ferramentas, feedback</span></div>
+      <div class="cx db"><b>pdfs — GridFS</b><span>arquivo original preservado</span></div>
+    </div>
+    <div class="linha" style="margin-top:10px">
+      <div class="cx idx"><b>busca_vetorial</b><span>quantização escalar <span class="tag">V2 #2</span></span></div>
+      <div class="cx idx"><b>Atlas Search textual</b><span>busca por palavra</span></div>
+      <div class="cx idx"><b>cache_vetorial</b><span>similaridade de perguntas</span></div>
+      <div class="cx idx"><b>B-tree em atos</b><span>nome · tipo · ano · órgão</span></div>
+    </div>
+  </div>
+
+  <div class="nota"><b>Mensagem-chave da demonstração:</b> um único banco — MongoDB Atlas — atende
+     busca vetorial, busca textual, consulta estruturada, cache e armazenamento do arquivo original.
+     Não há um segundo banco de vetores nem um motor de busca separado.</div>
+</section>
+
+<!-- ================= ABA 2 — INGESTAO ================= -->
+<section class="aba" id="aba-ingestao">
+  <h2 class="sec">Ciclo 1 — do PDF publicado ao dado pesquisável</h2>
+  <p class="sub">Avance passo a passo: o quadro em destaque mostra onde o processo está naquele momento.</p>
+
+  <div class="player">
+    <div class="num" id="i-num">1</div>
+    <div class="txt"><h4 id="i-tit"></h4><p id="i-desc"></p></div>
+    <div class="ctrl">
+      <button class="sec2" id="i-ant">← Anterior</button>
+      <button id="i-prox">Próximo →</button>
+      <button class="sec2" id="i-play">▶ Tocar</button>
+    </div>
+  </div>
+  <div class="passos-mini" id="i-mini"></div>
+
+  <div class="camada">
+    <h3>Pipeline de ingestão</h3>
+    <div class="linha">
+      <div class="cx ui" data-i="0"><b>📄 PDF do DODF</b><span>upload manual ou pasta monitorada</span></div>
+      <span class="seta">→</span>
+      <div class="cx app" data-i="1"><b>Fila paralela</b><span>ProcessPoolExecutor · resumível <span class="tag">V2 #1</span></span></div>
+      <span class="seta">→</span>
+      <div class="cx app" data-i="2"><b>Extração de texto</b><span>ordem de leitura + limpeza</span></div>
+      <span class="seta">→</span>
+      <div class="cx ia" data-i="3"><b>OCR de exceção</b><span>Gemini, só se a página vier vazia</span></div>
+    </div>
+    <div class="linha" style="margin-top:12px">
+      <div class="cx app" data-i="4"><b>Divisão em chunks</b><span>1.500 caracteres · 300 de sobreposição</span></div>
+      <span class="seta">→</span>
+      <div class="cx ia" data-i="5"><b>Embeddings em lote</b><span>Voyage · 1024 dimensões</span></div>
+      <span class="seta">→</span>
+      <div class="cx app" data-i="6"><b>Extração de atos</b><span>regex primeiro</span></div>
+      <span class="seta">→</span>
+      <div class="cx ia" data-i="7"><b>Reforço por LLM</b><span>Claude, no que o regex não pegou <span class="tag">V2 #4</span></span></div>
+    </div>
+    <div class="linha" style="margin-top:12px">
+      <div class="cx db" data-i="8"><b>🍃 Gravação no Atlas</b><span>documentos + atos + GridFS</span></div>
+      <span class="seta">→</span>
+      <div class="cx idx" data-i="9"><b>Índices atualizados</b><span>vetorial quantizado + textual + B-tree</span></div>
+      <div class="cx" style="background:#fff"><b>✅ Pronto para consulta</b><span>o PDF já responde perguntas</span></div>
+    </div>
+  </div>
+
+  <div class="linha">
+    <div class="dec"><b>Decisão 1 — a página tem texto?</b>
+      Se ficar abaixo do mínimo configurado, a página vai para OCR (Gemini). Caso contrário segue direto,
+      economizando tempo e custo.</div>
+    <div class="dec"><b>Decisão 2 — o regex identificou o ato?</b>
+      Sim → grava com <code>método = regex</code> (rápido e gratuito). Não, mas há palavra-gatilho →
+      entra na fila de reforço por LLM. Nenhum dos dois → permanece apenas como chunk pesquisável.</div>
+  </div>
+</section>
+
+<!-- ================= ABA 3 — CONSULTA ================= -->
+<section class="aba" id="aba-consulta">
+  <h2 class="sec">Ciclo 2 — da pergunta à resposta com fonte citada</h2>
+  <p class="sub">O sistema escolhe o caminho mais barato que responde corretamente. Avance para ver as três rotas possíveis.</p>
+
+  <div class="player">
+    <div class="num" id="c-num">1</div>
+    <div class="txt"><h4 id="c-tit"></h4><p id="c-desc"></p></div>
+    <div class="ctrl">
+      <button class="sec2" id="c-ant">← Anterior</button>
+      <button id="c-prox">Próximo →</button>
+      <button class="sec2" id="c-play">▶ Tocar</button>
+    </div>
+  </div>
+  <div class="passos-mini" id="c-mini"></div>
+
+  <div class="camada">
+    <h3>Fluxo de consulta</h3>
+    <div class="linha">
+      <div class="cx ui" data-c="0"><b>👤 Pergunta do usuário</b><span>"quantas nomeações em 2025?"</span></div>
+      <span class="seta">→</span>
+      <div class="cx app" data-c="1"><b>Conexão do pool</b><span>MongoClient reaproveitado <span class="tag">V2 #3</span></span></div>
+      <span class="seta">→</span>
+      <div class="cx idx" data-c="2"><b>Cache semântico</b><span>a pergunta já foi feita?</span></div>
+      <span class="seta">→</span>
+      <div class="cx db" data-c="3"><b>⚡ Resposta do cache</b><span>rota A · ~1,3 s</span></div>
+    </div>
+    <div class="linha" style="margin-top:12px">
+      <div class="cx app" data-c="4"><b>nl2query</b><span>interpreta a intenção → filtros JSON</span></div>
+      <span class="seta">→</span>
+      <div class="cx app" data-c="5"><b>Consulta analítica</b><span>agregação exata na coleção <code>atos</code></span></div>
+      <span class="seta">→</span>
+      <div class="cx db" data-c="6"><b>📊 Número exato</b><span>rota B · ~2,8 s · sem alucinação</span></div>
+    </div>
+    <div class="linha" style="margin-top:12px">
+      <div class="cx app" data-c="7"><b>Busca paralela</b><span>textual + vetorial simultâneas</span></div>
+      <span class="seta">→</span>
+      <div class="cx ia" data-c="8"><b>Rerank condicional</b><span>Voyage só quando faz diferença</span></div>
+      <span class="seta">→</span>
+      <div class="cx ia" data-c="9"><b>Claude redige</b><span>usando apenas os trechos recuperados</span></div>
+      <span class="seta">→</span>
+      <div class="cx db" data-c="10"><b>📝 Resposta com fontes</b><span>rota C · arquivo + página</span></div>
+    </div>
+    <div class="linha" style="margin-top:12px">
+      <div class="cx app" data-c="11"><b>Grava cache + métricas</b><span>a próxima pergunta igual custa ~1,3 s</span></div>
+    </div>
+  </div>
+
+  <div class="linha">
+    <div class="dec"><b>Decisão 1 — cache semântico</b>
+      Compara o vetor da pergunta com perguntas anteriores. Acima do limiar de similaridade, devolve a
+      resposta pronta e encerra o ciclo.</div>
+    <div class="dec"><b>Decisão 2 — é pergunta de contagem?</b>
+      Se sim, vai para a coleção <code>atos</code> e o número sai de uma agregação do MongoDB —
+      não de uma estimativa do modelo.</div>
+    <div class="dec"><b>Decisão 3 — precisa de rerank?</b>
+      Quando a busca vetorial já tem um vencedor claro, o rerank é dispensado e economiza uma chamada de API
+      <span class="tag">V2 #3</span></div>
+  </div>
+</section>
+
+<!-- ================= ABA 4 — NUMEROS ================= -->
+<section class="aba" id="aba-numeros">
+  <h2 class="sec">Números reais da base</h2>
+  <p class="sub">Medidos diretamente no ambiente em uso — úteis para dar concretude à demonstração.</p>
+
+  <div class="kpis">
+    <div class="kpi"><b>124</b><span>edições do DODF processadas</span></div>
+    <div class="kpi"><b>6.435</b><span>páginas indexadas</span></div>
+    <div class="kpi"><b>51.714</b><span>chunks pesquisáveis</span></div>
+    <div class="kpi"><b>8,0</b><span>chunks por página (média)</span></div>
+    <div class="kpi"><b>1.110</b><span>caracteres por chunk (média)</span></div>
+    <div class="kpi"><b>57,4 mi</b><span>caracteres de texto útil</span></div>
+    <div class="kpi"><b>1024</b><span>dimensões por vetor</span></div>
+    <div class="kpi"><b>100%</b><span>consultas bem-sucedidas</span></div>
+  </div>
+
+  <h2 class="sec">Latência medida por rota</h2>
+  <p class="sub">O caminho escolhido determina o tempo de resposta — daí a importância do cache e da rota analítica.</p>
+  <table>
+    <tr><th>Rota</th><th>Mediana</th><th>p95</th><th>O que acontece</th></tr>
+    <tr><td><b>A · Cache semântico</b></td><td>1,3 s</td><td>1,6 s</td><td>Só recuperação; nenhuma chamada de LLM</td></tr>
+    <tr><td><b>B · Consulta analítica</b></td><td>2,8 s</td><td>—</td><td>Agregação exata na coleção <code>atos</code></td></tr>
+    <tr><td><b>C · Busca semântica</b></td><td>11,9 s</td><td>35,2 s</td><td>Recuperação + rerank + geração pelo LLM</td></tr>
+  </table>
+  <div class="nota"><b>Conclusão técnica:</b> a diferença entre 1,3 s e 11,9 s é quase toda tempo de API de LLM,
+     não de banco. Por isso as otimizações da V2 atacam o número de chamadas externas (cache e rerank condicional),
+     e não o tamanho do cluster.</div>
+
+  <h2 class="sec">O que a Versão 2 acrescentou</h2>
+  <table>
+    <tr><th>#</th><th>Melhoria</th><th>Ganho</th></tr>
+    <tr><td>1</td><td>Ingestão paralela e resumível</td><td>Vários PDFs por vez; retomada após falha sem reprocessar</td></tr>
+    <tr><td>2</td><td>Quantização escalar do índice vetorial</td><td>Menos memória por vetor, recall praticamente intacto</td></tr>
+    <tr><td>3</td><td>Pool de conexões + rerank condicional</td><td>Suporta acessos simultâneos; evita chamada de API desnecessária</td></tr>
+    <tr><td>4</td><td>Reforço de atos por LLM</td><td>Recupera atos que o regex não capturou, sem reprocessar a base</td></tr>
+  </table>
+</section>
+
+<!-- ================= ABA 5 — DIAGRAMAS ================= -->
+<section class="aba" id="aba-diagramas">
+  <h2 class="sec">Diagramas técnicos</h2>
+  <p class="sub">Versões detalhadas, para a parte técnica da apresentação.</p>
+  <div class="img-wrap" style="margin-bottom:16px">
+    <img src="arquitetura_16x9.png" alt="Arquitetura completa do sistema">
+    <p class="sub" style="margin:10px 0 0">Arquitetura completa — camadas, coleções e índices</p>
+  </div>
+  <div class="img-wrap">
+    <img src="arvore_decisao.png" alt="Árvore de decisão da solução">
+    <p class="sub" style="margin:10px 0 0">Árvore de decisão — todos os desvios da ingestão e da consulta</p>
+  </div>
+</section>
+
+</main>
+
+<footer>DODF Search · Casa Civil do Distrito Federal · MongoDB Atlas + Voyage AI + Anthropic Claude</footer>
+
+<script>
+/* ---------- navegacao entre abas ---------- */
+document.querySelectorAll('nav button').forEach(function (b) {
+  b.onclick = function () {
+    document.querySelectorAll('nav button').forEach(x => x.classList.remove('on'));
+    document.querySelectorAll('.aba').forEach(x => x.classList.remove('on'));
+    b.classList.add('on');
+    document.getElementById('aba-' + b.dataset.aba).classList.add('on');
+  };
+});
+
+/* ---------- roteiros narrados ---------- */
+var ROTEIRO_INGESTAO = [
+  ["Chega uma nova edição do DODF",
+   "O PDF entra por upload na tela ou pela pasta monitorada. O arquivo original é guardado no GridFS, então a fonte pode sempre ser auditada."],
+  ["A fila processa vários PDFs ao mesmo tempo",
+   "Cada PDF vai para um processo separado. Se a máquina cair no meio, a retomada continua de onde parou, sem reprocessar o que já foi feito."],
+  ["O texto é extraído respeitando a ordem de leitura",
+   "O DODF tem colunas. A extração segue a ordem correta e remove caracteres invisíveis que quebrariam a busca."],
+  ["Página sem texto vai para OCR",
+   "Só as páginas que vêm vazias (escaneadas) são enviadas ao Gemini. É a exceção, não a regra — o que mantém o custo baixo."],
+  ["O texto é dividido em chunks com sobreposição",
+   "Blocos de até 1.500 caracteres com 300 de sobreposição, para que um ato dividido entre dois blocos não seja perdido. Na base atual: média de 1.110 caracteres por chunk."],
+  ["Cada chunk recebe um vetor de significado",
+   "A Voyage converte o texto em 1.024 números que representam o sentido. É isso que permite encontrar 'servidor afastado' ao buscar por 'licença médica'."],
+  ["O regex extrai os atos de pessoal",
+   "Nomeações, exonerações, designações e dispensas são convertidas em registros estruturados: nome, tipo, cargo, órgão e data."],
+  ["O LLM reforça o que o regex não pegou",
+   "Chunks com palavra-gatilho mas sem ato reconhecido vão para o Claude. A gravação é idempotente: rodar de novo não duplica nada."],
+  ["Tudo é gravado no MongoDB Atlas",
+   "Chunk e vetor em documentos, ato estruturado em atos, PDF original no GridFS — no mesmo banco, sem sincronização entre sistemas."],
+  ["Os índices ficam prontos e o PDF já responde",
+   "Índice vetorial quantizado, índice textual do Atlas Search e índices B-tree nos atos. A partir daqui a edição já aparece nas buscas e nas contagens."]
+];
+
+var ROTEIRO_CONSULTA = [
+  ["O usuário pergunta em linguagem natural",
+   "Nenhum filtro, nenhum formulário: apenas a pergunta, como seria feita a um colega."],
+  ["A conexão vem do pool, já aberta",
+   "Não se paga o custo de abrir conexão a cada pergunta, e vários usuários simultâneos são atendidos sem fila."],
+  ["Primeira pergunta: alguém já perguntou isso?",
+   "O vetor da pergunta é comparado com perguntas anteriores. Se a similaridade passar do limiar, a resposta pronta é devolvida."],
+  ["Rota A — resposta do cache",
+   "Cerca de 1,3 segundo, sem nenhuma chamada de LLM. É a rota mais barata e a mais rápida."],
+  ["Sem cache: a pergunta é interpretada",
+   "O nl2query traduz a intenção em filtros estruturados — tipo de ato, ano, nome, órgão — e decide se a pergunta é de contagem."],
+  ["Pergunta de contagem vai para a coleção estruturada",
+   "Uma agregação do MongoDB sobre a coleção atos. O número vem do banco, com filtro de nome por palavra inteira para não confundir 'Pedro' com 'Pedroso'."],
+  ["Rota B — número exato",
+   "Cerca de 2,8 segundos. O modelo não estima quantidade nenhuma: ele apenas apresenta o resultado que o banco calculou."],
+  ["Pergunta aberta: busca textual e vetorial em paralelo",
+   "As duas buscas rodam ao mesmo tempo e os resultados são combinados. A textual acerta o termo exato; a vetorial acerta o sentido."],
+  ["O rerank só entra quando faz diferença",
+   "Se a busca vetorial já tem um vencedor claro, o rerank é dispensado — uma chamada de API a menos. Em resultados ambíguos, ele reordena por relevância."],
+  ["O Claude redige a resposta a partir dos trechos",
+   "O modelo só pode usar o que foi recuperado do banco. É esse cerco que evita resposta inventada."],
+  ["Rota C — resposta com fonte citada",
+   "Cada afirmação aponta o arquivo e a página de origem, e o PDF original pode ser aberto para conferência."],
+  ["A resposta vira cache e métrica",
+   "A pergunta e a resposta alimentam o cache — a próxima igual custa ~1,3 s — e o tempo é registrado para auditoria."]
+];
+
+/* ---------- motor de animacao dos passos ---------- */
+function montarPlayer(cfg) {
+  var idx = 0, timer = null;
+  var caixas = document.querySelectorAll('[data-' + cfg.attr + ']');
+  var mini = document.getElementById(cfg.pre + '-mini');
+
+  cfg.roteiro.forEach(function (_, i) {
+    var t = document.createElement('i');
+    t.onclick = function () { parar(); idx = i; render(); };
+    mini.appendChild(t);
+  });
+  var traces = mini.querySelectorAll('i');
+
+  function render() {
+    document.getElementById(cfg.pre + '-num').textContent = idx + 1;
+    document.getElementById(cfg.pre + '-tit').textContent = cfg.roteiro[idx][0];
+    document.getElementById(cfg.pre + '-desc').textContent = cfg.roteiro[idx][1];
+    caixas.forEach(function (c) {
+      var n = parseInt(c.dataset[cfg.attr], 10);
+      c.classList.toggle('ativo', n === idx);
+      c.classList.toggle('apagado', n > idx);
+    });
+    traces.forEach(function (t, i) { t.classList.toggle('on', i <= idx); });
+    document.getElementById(cfg.pre + '-ant').disabled = (idx === 0);
+    document.getElementById(cfg.pre + '-prox').disabled = (idx === cfg.roteiro.length - 1);
+  }
+  function parar() {
+    if (timer) { clearInterval(timer); timer = null; }
+    document.getElementById(cfg.pre + '-play').textContent = '▶ Tocar';
+  }
+  document.getElementById(cfg.pre + '-prox').onclick = function () {
+    parar(); if (idx < cfg.roteiro.length - 1) { idx++; render(); }
+  };
+  document.getElementById(cfg.pre + '-ant').onclick = function () {
+    parar(); if (idx > 0) { idx--; render(); }
+  };
+  document.getElementById(cfg.pre + '-play').onclick = function () {
+    if (timer) { parar(); return; }
+    this.textContent = '⏸ Pausar';
+    if (idx === cfg.roteiro.length - 1) { idx = 0; render(); }
+    timer = setInterval(function () {
+      if (idx >= cfg.roteiro.length - 1) { parar(); return; }
+      idx++; render();
+    }, 4200);
+  };
+  render();
+}
+
+montarPlayer({ pre: 'i', attr: 'i', roteiro: ROTEIRO_INGESTAO });
+montarPlayer({ pre: 'c', attr: 'c', roteiro: ROTEIRO_CONSULTA });
+
+/* ---------- setas do teclado ---------- */
+document.addEventListener('keydown', function (e) {
+  var ativa = document.querySelector('.aba.on').id;
+  var pre = ativa === 'aba-ingestao' ? 'i' : (ativa === 'aba-consulta' ? 'c' : null);
+  if (!pre) return;
+  if (e.key === 'ArrowRight') document.getElementById(pre + '-prox').click();
+  if (e.key === 'ArrowLeft') document.getElementById(pre + '-ant').click();
+});
+</script>
+</body>
+</html>

@@ -1,10 +1,14 @@
 """
-processar_pdf.py — Processamento de PDFs (Voyage 4 + GridFS)
+processar_pdf.py — Processamento de PDFs (autoEmbed + GridFS)
 ==============================================================
 Melhorias desta versao:
   - Limpeza AGRESSIVA: remove ".....", "_____", "------", linhas pontilhadas
   - Normalizacao de espacos (incluindo nbsp), quebras, paragrafos
   - Overlap GARANTIDO entre chunks via splitter padrao + verificacao
+  - Embeddings gerados pelo Atlas (Automated Embedding) a partir de 'texto':
+    a aplicacao NAO chama a API da Voyage na ingestao
+  - Metadados de edicao (data, numero_edicao, tipo_edicao) extraidos do nome
+    do arquivo para pre-filtros do $vectorSearch
   - Logs com flush em todas as etapas
 
 Uso:
@@ -12,6 +16,8 @@ Uso:
   python processar_pdf.py --reprocessar        (limpa o banco)
   python processar_pdf.py --reprocessar-base   (reprocessa in-place)
   python processar_pdf.py --migrar
+  python processar_pdf.py --migrar-metadados   (chunks existentes: metadados
+                                                 de edicao + remove 'embedding')
   python processar_pdf.py --testar-limpeza arquivo.pdf
 """
 
@@ -24,7 +30,7 @@ from datetime import datetime
 
 import fitz
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from config import get_db, get_gridfs, get_collection, get_embeddings, CFG
+from config import get_db, get_gridfs, get_collection, CFG
 
 
 # =====================================================================
@@ -228,24 +234,48 @@ def _salvar_no_gridfs(nome: str, data: bytes, hash_md5: str):
                   upload_date=datetime.now())
 
 
+# Nome padrao do DODF: "DODF 012 17-01-2025 EDICAO EXTRA A.pdf"
+_RE_NOME_DODF = re.compile(
+    r'DODF\s+(?P<num>\d{1,4})\s+(?P<d>\d{2})-(?P<m>\d{2})-(?P<a>\d{4})'
+    r'(?:\s+(?P<tipo>[^.]+?))?\s*\.pdf$', re.IGNORECASE)
+
+
+def _metadados_edicao(nome: str) -> dict:
+    """Extrai data/numero/tipo da edicao a partir do nome do arquivo.
+
+    Retorna dict vazio se o nome nao segue o padrao do DODF (os chunks
+    continuam pesquisaveis; apenas nao entram nos pre-filtros de edicao).
+    """
+    m = _RE_NOME_DODF.search(nome.strip())
+    if not m:
+        return {}
+    try:
+        data = datetime(int(m.group("a")), int(m.group("m")), int(m.group("d")))
+    except ValueError:
+        return {}
+    tipo = (m.group("tipo") or "INTEGRA").strip().upper()
+    tipo = re.sub(r'\s+', ' ', tipo)
+    return {"data": data, "numero_edicao": int(m.group("num")),
+            "tipo_edicao": tipo, "ano": data.year}
+
+
 def _registrar_pdf(nome, hash_md5, gridfs_id, tamanho, total_paginas,
                    total_chunks, origem):
     col = get_db()["pdfs"]
-    col.update_one(
-        {"hash_md5": hash_md5},
-        {"$set": {
-            "nome_arquivo": nome, "hash_md5": hash_md5,
-            "gridfs_id": gridfs_id, "tamanho_bytes": tamanho,
-            "total_paginas": total_paginas, "total_chunks": total_chunks,
-            "status": "processado", "enviado_por": origem,
-            "embedding_modelo": CFG.VOYAGE_EMBEDDING_MODEL,
-            "embedding_dimensao": CFG.VOYAGE_EMBEDDING_DIMENSION,
-            "data_upload": datetime.now(),
-            "data_processamento": datetime.now(),
-            "erro": None
-        }},
-        upsert=True
-    )
+    campos = {
+        "nome_arquivo": nome, "hash_md5": hash_md5,
+        "gridfs_id": gridfs_id, "tamanho_bytes": tamanho,
+        "total_paginas": total_paginas, "total_chunks": total_chunks,
+        "status": "processado", "enviado_por": origem,
+        "embedding_modelo": CFG.VOYAGE_EMBEDDING_MODEL,
+        "embedding_dimensao": CFG.VOYAGE_EMBEDDING_DIMENSION,
+        "embedding_origem": "atlas_auto_embed",
+        "data_upload": datetime.now(),
+        "data_processamento": datetime.now(),
+        "erro": None
+    }
+    campos.update(_metadados_edicao(nome))
+    col.update_one({"hash_md5": hash_md5}, {"$set": campos}, upsert=True)
     return col.find_one({"hash_md5": hash_md5})["_id"]
 
 
@@ -354,6 +384,7 @@ def _criar_chunks(paginas: list, nome: str, total_paginas: int) -> list:
     chunks = []
     descartados = 0
     pos_busca = 0  # posicao corrente no texto_completo
+    edicao = _metadados_edicao(nome)
 
     for numero, pedaco in enumerate(pedacos, 1):
         pedaco_limpo = _limpar_chunk_final(pedaco)
@@ -394,24 +425,21 @@ def _criar_chunks(paginas: list, nome: str, total_paginas: int) -> list:
                     overlap_anterior = tail[-tamanho:]
                     break
 
-        chunks.append({
-            "texto": pedaco_limpo,
-            "metadados": {
-                "arquivo": nome,
-                "pagina": pags_chunk[0],
-                "paginas_grupo": pags_chunk,
-                "chunk_numero": len(chunks) + 1,
-                "total_paginas": total_paginas,
-                "tamanho_chars": len(pedaco_limpo),
-                "palavras": qualidade["palavras"],
-                "ratio_alfa": qualidade["ratio_alfa"],
-                "tem_overlap_anterior": bool(overlap_anterior),
-                "overlap_chars": len(overlap_anterior),
-                "embedding_modelo": CFG.VOYAGE_EMBEDDING_MODEL,
-                "embedding_dimensao": CFG.VOYAGE_EMBEDDING_DIMENSION,
-                "processado_em": datetime.now()
-            }
-        })
+        metadados = {
+            "arquivo": nome,
+            "pagina": pags_chunk[0],
+            "paginas_grupo": pags_chunk,
+            "chunk_numero": len(chunks) + 1,
+            "total_paginas": total_paginas,
+            "tamanho_chars": len(pedaco_limpo),
+            "palavras": qualidade["palavras"],
+            "ratio_alfa": qualidade["ratio_alfa"],
+            "tem_overlap_anterior": bool(overlap_anterior),
+            "overlap_chars": len(overlap_anterior),
+            "processado_em": datetime.now()
+        }
+        metadados.update(edicao)
+        chunks.append({"texto": pedaco_limpo, "metadados": metadados})
 
     dt = time.time() - t0
     com_overlap = sum(1 for c in chunks if c["metadados"]["tem_overlap_anterior"])
@@ -422,77 +450,46 @@ def _criar_chunks(paginas: list, nome: str, total_paginas: int) -> list:
 
 
 # =====================================================================
-# EMBEDDINGS
+# PERSISTENCIA DOS CHUNKS (embeddings gerados pelo Atlas autoEmbed)
 # =====================================================================
 
-def _gerar_embeddings_e_salvar(chunks: list, hash_md5: str, pdf_id=None,
-                                callback=None):
-    modelo = get_embeddings()
+def _salvar_chunks(chunks: list, hash_md5: str, pdf_id=None, callback=None):
+    """Grava os chunks em lotes. O vetor e gerado pelo Atlas ao indexar
+    o campo 'texto' (indice autoEmbed) — nenhuma chamada a API aqui."""
     col = get_collection()
-    LOTE = CFG.VOYAGE_EMBEDDING_BATCH
-    MAX_RETRIES = 3
+    LOTE = 500
     total = len(chunks)
     total_lotes = (total + LOTE - 1) // LOTE
 
-    print(f"        Embeddings: {total} chunks em {total_lotes} lotes de {LOTE}",
+    print(f"        Gravando {total} chunks em {total_lotes} lote(s) "
+          f"(embedding: Atlas autoEmbed/{CFG.VOYAGE_EMBEDDING_MODEL})",
           flush=True)
-    tempo_api_total = 0
+    t0 = time.time()
 
     for i in range(0, total, LOTE):
         lote = chunks[i:i + LOTE]
-        textos = [c["texto"] for c in lote]
-        num_lote = i // LOTE + 1
-
-        vetores = None
-        for tentativa in range(1, MAX_RETRIES + 1):
-            try:
-                t0 = time.time()
-                vetores = modelo.embed_documents(textos)
-                dt_api = time.time() - t0
-                tempo_api_total += dt_api
-                break
-            except Exception as e:
-                erro = str(e)[:120]
-                if tentativa < MAX_RETRIES:
-                    espera = tentativa * 5
-                    print(f"        ⚠️  Lote {num_lote}: {erro} "
-                          f"— retry em {espera}s ({tentativa}/{MAX_RETRIES})",
-                          flush=True)
-                    time.sleep(espera)
-                else:
-                    print(f"        ❌ Lote {num_lote}: falhou", flush=True)
-                    raise
-
         docs = []
-        for j, chunk in enumerate(lote):
+        for chunk in lote:
             doc = {
                 "texto": chunk["texto"],
-                "embedding": vetores[j],
                 "metadados": chunk["metadados"],
                 "hash_arquivo": hash_md5,
             }
             if pdf_id:
                 doc["pdf_id"] = pdf_id
             docs.append(doc)
-        col.insert_many(docs)
+        col.insert_many(docs, ordered=False)
 
         feitos = min(i + LOTE, total)
         pct = int(feitos / total * 100)
-
         if callback:
             callback(feitos, total, pct)
         else:
-            eta = ""
-            if tempo_api_total > 0 and feitos > 0:
-                tempo_chunk = tempo_api_total / feitos
-                rest = tempo_chunk * (total - feitos)
-                if rest > 5:
-                    eta = f" | ETA: {int(rest)}s"
-            print(f"        [{num_lote}/{total_lotes}] {feitos}/{total} "
-                  f"({pct}%) [{dt_api:.1f}s]{eta}", flush=True)
+            print(f"        [{i // LOTE + 1}/{total_lotes}] {feitos}/{total} "
+                  f"({pct}%)", flush=True)
 
-    print(f"        ✅ Embeddings concluidos ({tempo_api_total:.1f}s API)",
-          flush=True)
+    print(f"        ✅ Chunks gravados em {time.time() - t0:.1f}s "
+          f"(vetores serao gerados pelo indice)", flush=True)
 
 
 # =====================================================================
@@ -567,8 +564,7 @@ def processar_pdf_bytes(nome: str, data: bytes, origem: str = "upload_web",
                     "erro": "Conteudo insuficiente apos limpeza"}
 
         pdf_id = col_pdfs.find_one({"hash_md5": hash_md5})["_id"]
-        _gerar_embeddings_e_salvar(chunks, hash_md5, pdf_id=pdf_id,
-                                    callback=callback)
+        _salvar_chunks(chunks, hash_md5, pdf_id=pdf_id, callback=callback)
         n_atos = _extrair_e_salvar_atos(chunks, hash_md5)
         _registrar_pdf(nome, hash_md5, gridfs_id, len(data),
                         total_pags, len(chunks), origem)
@@ -587,7 +583,7 @@ def processar_pdf(caminho: str, origem: str = "local"):
     tam_mb = os.path.getsize(caminho) / 1024 / 1024
     print(f"\n{'='*60}", flush=True)
     print(f"  PROCESSANDO: {nome} ({tam_mb:.1f} MB)", flush=True)
-    print(f"  Embedding: {CFG.VOYAGE_EMBEDDING_MODEL} "
+    print(f"  Embedding: Atlas autoEmbed / {CFG.VOYAGE_EMBEDDING_MODEL} "
           f"({CFG.VOYAGE_EMBEDDING_DIMENSION}d)", flush=True)
     print(f"{'='*60}", flush=True)
 
@@ -710,6 +706,42 @@ def limpar_banco():
     print(f"  Registros PDFs removidos: {r.deleted_count}")
 
 
+def migrar_metadados():
+    """Adapta chunks ja ingeridos ao modelo autoEmbed, sem reprocessar PDFs.
+
+    Para cada arquivo distinto: grava metadados.data/numero_edicao/tipo_edicao
+    (pre-filtros) e remove o array 'embedding' gerado pela aplicacao — o
+    indice autoEmbed gera os vetores a partir de 'texto'. Idempotente.
+    """
+    col = get_collection()
+    col_pdfs = get_db()["pdfs"]
+    arquivos = col.distinct("metadados.arquivo")
+    print(f"\n{'='*60}\n  MIGRACAO DE METADADOS — {len(arquivos)} arquivo(s)"
+          f"\n{'='*60}\n", flush=True)
+
+    t0 = time.time()
+    atualizados = sem_padrao = 0
+    for i, nome in enumerate(sorted(arquivos), 1):
+        edicao = _metadados_edicao(nome)
+        upd = {"$unset": {"embedding": "", "metadados.embedding_modelo": "",
+                          "metadados.embedding_dimensao": ""}}
+        if edicao:
+            upd["$set"] = {f"metadados.{k}": v for k, v in edicao.items()}
+            edicao_pdf = dict(edicao, embedding_origem="atlas_auto_embed")
+            col_pdfs.update_one({"nome_arquivo": nome}, {"$set": edicao_pdf})
+        else:
+            sem_padrao += 1
+        r = col.update_many({"metadados.arquivo": nome}, upd)
+        atualizados += r.modified_count
+        rotulo = (f"{edicao['data']:%d/%m/%Y} ed.{edicao['numero_edicao']} "
+                  f"{edicao['tipo_edicao']}" if edicao else "sem padrao DODF")
+        print(f"  [{i}/{len(arquivos)}] {nome[:50]:<50} {rotulo} "
+              f"({r.modified_count} chunks)", flush=True)
+
+    print(f"\n  Concluido em {time.time() - t0:.0f}s: {atualizados} chunks "
+          f"atualizados, {sem_padrao} arquivo(s) fora do padrao.", flush=True)
+
+
 def testar_limpeza(caminho: str):
     """Testa limpeza E overlap em modo verbose — diagnostico."""
     nome = os.path.basename(caminho)
@@ -769,6 +801,7 @@ if __name__ == "__main__":
         print("  python processar_pdf.py --reprocessar       (limpa o banco)")
         print("  python processar_pdf.py --reprocessar-base  (reprocessa in-place)")
         print("  python processar_pdf.py --migrar")
+        print("  python processar_pdf.py --migrar-metadados")
         print("  python processar_pdf.py --testar-limpeza arquivo.pdf")
         sys.exit(1)
 
@@ -780,6 +813,8 @@ if __name__ == "__main__":
         reprocessar_base()
     elif flag == "--migrar":
         migrar_pdfs_para_gridfs()
+    elif flag == "--migrar-metadados":
+        migrar_metadados()
     elif flag == "--testar-limpeza":
         if len(sys.argv) < 3:
             print("Uso: python processar_pdf.py --testar-limpeza arquivo.pdf")

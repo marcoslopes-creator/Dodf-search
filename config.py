@@ -3,8 +3,10 @@ config.py — Configuracao Centralizada (Voyage 4 + MongoDB)
 ============================================================
 - MongoClient unico com pool
 - GridFS para armazenamento de PDFs
-- Voyage 4 (voyage-4-large + rerank-2.5)
-- Suporta provider 'atlas' (ai.mongodb.com) ou 'voyage' (api.voyageai.com)
+- Voyage 4 via Atlas Automated Embedding (autoEmbed):
+    * documentos indexados com voyage-4-large (servidor, na indexacao)
+    * consultas embedadas com voyage-4-lite (servidor, no $vectorSearch)
+- rerank-2.5 via API (provider 'atlas' ai.mongodb.com ou 'voyage')
 """
 
 import os
@@ -13,7 +15,16 @@ from pymongo import MongoClient
 from gridfs import GridFS
 from dotenv import load_dotenv
 
-load_dotenv()
+# Variaveis do Claude Code exportadas no shell (~/.zshrc) sao lidas
+# automaticamente pelo SDK da Anthropic e desviariam as chamadas da aplicacao
+# (base_url/token/alias de modelo). A fonte de configuracao do app e o .env.
+for _v in ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_MODEL",
+           "ANTHROPIC_API_KEY", "ANTHROPIC_DEFAULT_OPUS_MODEL",
+           "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+           "ANTHROPIC_SMALL_FAST_MODEL"):
+    os.environ.pop(_v, None)
+
+load_dotenv(override=True)
 
 
 class _Config:
@@ -27,7 +38,11 @@ class _Config:
     # Voyage 4
     VOYAGE_API_KEY = os.getenv("VOYAGE_API_KEY", "")
     VOYAGE_API_PROVIDER = os.getenv("VOYAGE_API_PROVIDER", "atlas").lower()
+    # Modelo dos documentos (definido no indice autoEmbed; muda => reindexa)
     VOYAGE_EMBEDDING_MODEL = os.getenv("VOYAGE_EMBEDDING_MODEL", "voyage-4-large")
+    # Modelo das consultas (asymmetric retrieval: mesma familia Voyage 4,
+    # espaco vetorial compativel, menor latencia/custo por pergunta)
+    VOYAGE_QUERY_MODEL = os.getenv("VOYAGE_QUERY_MODEL", "voyage-4-lite")
     VOYAGE_EMBEDDING_DIMENSION = int(os.getenv("VOYAGE_EMBEDDING_DIMENSION", "1024"))
     VOYAGE_EMBEDDING_BATCH = int(os.getenv("VOYAGE_EMBEDDING_BATCH", "128"))
     VOYAGE_TRUNCATION = os.getenv("VOYAGE_TRUNCATION", "true").lower() == "true"
@@ -40,8 +55,15 @@ class _Config:
 
     # LLMs
     LLM_MODEL = os.getenv("LLM_MODEL", "gemma4:26b")
+    # Claude: via Grove (gateway corporativo, rota compativel com a API
+    # Anthropic) quando GROVE_API_KEY esta definido; senao API direta.
+    GROVE_BASE_URL = os.getenv("GROVE_BASE_URL",
+                               "https://ai-gateway.corp.mongodb.com").rstrip("/")
+    GROVE_API_KEY = os.getenv("GROVE_API_KEY", "")
     ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
     ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+    CLAUDE_PROVEDOR = "Grove" if GROVE_API_KEY else "Anthropic"
+    CLAUDE_DISPONIVEL = bool(GROVE_API_KEY or ANTHROPIC_API_KEY)
     GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
     GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3-pro-preview")
     MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "")
@@ -53,10 +75,51 @@ class _Config:
     CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "300"))
     PDF_SERVER_PORT = int(os.getenv("PDF_SERVER_PORT", "8502"))
 
+    # Ingestao paralela e resumivel (V2 #1)
+    INGEST_WORKERS = int(os.getenv("INGEST_WORKERS", "4"))
+
+    # Indice vetorial autoEmbed / quantizacao (V2 #2)
+    # VECTOR_FIELD e o campo de TEXTO que o Atlas embeda (nao um array).
+    VECTOR_INDEX_NAME = os.getenv("VECTOR_INDEX_NAME", "busca_vetorial")
+    VECTOR_FIELD = os.getenv("VECTOR_FIELD", "texto")
+    # none | scalar | binary. none = fidelidade total (float32); a base atual
+    # (~52k vetores, ~210 MB) cabe em memoria sem quantizar.
+    VECTOR_QUANTIZATION = os.getenv("VECTOR_QUANTIZATION", "none").lower()
+    VECTOR_NUM_CANDIDATES = int(os.getenv("VECTOR_NUM_CANDIDATES", "150"))
+    # Pre-filtros do $vectorSearch (data/edicao/arquivo extraidos da pergunta)
+    VECTOR_PREFILTER_ENABLED = os.getenv("VECTOR_PREFILTER_ENABLED", "true").lower() == "true"
+    # Busca hibrida via $rankFusion (MongoDB >= 8.1): $search + $vectorSearch
+    # fundidos no servidor por Reciprocal Rank Fusion, em uma unica consulta.
+    # false = fusao no cliente (duas consultas em paralelo + intercalacao).
+    RANKFUSION_ENABLED = os.getenv("RANKFUSION_ENABLED", "true").lower() == "true"
+    RANKFUSION_PESO_TEXTUAL = float(os.getenv("RANKFUSION_PESO_TEXTUAL", "1"))
+    RANKFUSION_PESO_SEMANTICO = float(os.getenv("RANKFUSION_PESO_SEMANTICO", "1"))
+    # Cache semantico: autoEmbed sobre o texto da pergunta (modelo leve)
+    CACHE_INDEX_NAME = os.getenv("CACHE_INDEX_NAME", "cache_vetorial")
+    CACHE_VECTOR_FIELD = os.getenv("CACHE_VECTOR_FIELD", "pergunta")
+    CACHE_EMBEDDING_MODEL = os.getenv("CACHE_EMBEDDING_MODEL", "voyage-4-lite")
+
+    # Latencia / concorrencia (V2 #3)
+    MONGO_MAX_POOL_SIZE = int(os.getenv("MONGO_MAX_POOL_SIZE", "100"))
+    MONGO_MIN_POOL_SIZE = int(os.getenv("MONGO_MIN_POOL_SIZE", "5"))
+    MONGO_SERVER_SELECTION_TIMEOUT_MS = int(
+        os.getenv("MONGO_SERVER_SELECTION_TIMEOUT_MS", "5000"))
+    # Cache semantico. Com autoEmbed a pergunta armazenada e embedada como
+    # "document" e a consulta como "query" (assimetrico): texto identico pontua
+    # ~0.85, nao 1.0. Calibrado: parafrases >= 0.84; mesma pergunta com outro
+    # ano/orgao <= 0.80.
+    CACHE_SIMILARITY = float(os.getenv("CACHE_SIMILARITY", "0.82"))
+    CACHE_NUM_CANDIDATES = int(os.getenv("CACHE_NUM_CANDIDATES", "10"))
+    # Rerank condicional: pula o rerank (1 ida a API) quando o melhor score
+    # semantico ja e >= este limiar (vencedor claro). 0 = sempre rerankear.
+    RERANK_SKIP_SCORE = float(os.getenv("RERANK_SKIP_SCORE", "0"))
+
     # Extracao estruturada de atos (Fase 1)
     ATOS_COLLECTION = os.getenv("ATOS_COLLECTION", "atos")
     ATOS_EXTRACTION_ENABLED = os.getenv("ATOS_EXTRACTION_ENABLED", "true").lower() == "true"
     ATOS_LLM_ENABLED = os.getenv("ATOS_LLM_ENABLED", "true").lower() == "true"
+    # Reforco de atos via LLM sobre chunks residuais (V2 #4)
+    ATOS_REFORCO_WORKERS = int(os.getenv("ATOS_REFORCO_WORKERS", "4"))
 
     # OCR de fallback (so para paginas que falham na extracao de texto)
     OCR_ENABLED = os.getenv("OCR_ENABLED", "false").lower() == "true"
@@ -70,6 +133,21 @@ CFG = _Config()
 
 
 # =====================================================================
+# LLM CLAUDE (Grove ou Anthropic direto) — ponto unico de instanciacao
+# =====================================================================
+
+def criar_claude(**kwargs):
+    """ChatAnthropic apontando para o Grove (se configurado) ou para a API
+    direta. kwargs: temperature, max_tokens, timeout, max_retries..."""
+    from langchain_anthropic import ChatAnthropic
+    if CFG.GROVE_API_KEY:
+        return ChatAnthropic(model=CFG.ANTHROPIC_MODEL, api_key=CFG.GROVE_API_KEY,
+                             base_url=f"{CFG.GROVE_BASE_URL}/anthropic", **kwargs)
+    return ChatAnthropic(model=CFG.ANTHROPIC_MODEL, api_key=CFG.ANTHROPIC_API_KEY,
+                         **kwargs)
+
+
+# =====================================================================
 # MONGODB CLIENT (singleton com connection pool)
 # =====================================================================
 
@@ -77,10 +155,18 @@ _client = None
 
 
 def get_client() -> MongoClient:
-    """MongoClient com connection pool compartilhado."""
+    """MongoClient com connection pool compartilhado (tunado para concorrencia)."""
     global _client
     if _client is None:
-        _client = MongoClient(CFG.MONGODB_URI, maxPoolSize=20, minPoolSize=2)
+        _client = MongoClient(
+            CFG.MONGODB_URI,
+            maxPoolSize=CFG.MONGO_MAX_POOL_SIZE,
+            minPoolSize=CFG.MONGO_MIN_POOL_SIZE,
+            serverSelectionTimeoutMS=CFG.MONGO_SERVER_SELECTION_TIMEOUT_MS,
+            retryWrites=True,
+            retryReads=True,
+            appname="dodf-search",
+        )
     return _client
 
 
@@ -129,7 +215,8 @@ def _headers() -> dict:
 
 
 # =====================================================================
-# EMBEDDINGS
+# EMBEDDINGS (API direta — apenas diagnostico/health check; a busca e a
+# ingestao usam Automated Embedding no Atlas, sem chamar esta API)
 # =====================================================================
 
 def _build_payload(textos: list, input_type: str) -> dict:

@@ -1,17 +1,25 @@
 """
-ui_theme.py — Identidade visual MongoDB para o DODF Search
-============================================================
+ui_theme.py — Identidade visual: Casa Civil DF + MongoDB (DODF Search)
+======================================================================
 Paleta: Spring Green #00ED64 | Evergreen #00684A | Slate #001E2B
-Expoe: aplicar_tema(), cabecalho(), marca_sidebar()
+Logos: brasao do Distrito Federal (Casa Civil) + MongoDB (provedor).
+Expoe: aplicar_tema(), cabecalho(), marca_sidebar(), marca_app()
 """
 
+import os
+import base64
 import streamlit as st
 
 VERDE = "#00ED64"
 VERDE_ESC = "#00684A"
 SLATE = "#001E2B"
 
-# Folha MongoDB (SVG inline)
+_ASSETS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+_MDB = os.path.join(_ASSETS, "mongodb_logo.svg")
+_MDB_WHITE = os.path.join(_ASSETS, "mongodb_logo_white.svg")
+_BRASAO = os.path.join(_ASSETS, "df_brasao.svg")
+
+# Folha MongoDB (SVG inline) — fallback quando os assets nao existem
 _LEAF = (
     "<svg width='30' height='30' viewBox='0 0 100 100' aria-hidden='true'>"
     "<path fill='#00ED64' d='M50 4 C30 34 26 70 47 94 C49 96 51 96 53 94 "
@@ -19,6 +27,33 @@ _LEAF = (
     "<path fill='#00684A' d='M50 96 C48 70 49 38 50 12 C51 38 52 70 50 96 Z'/>"
     "</svg>"
 )
+
+
+def _ensure_white_logo():
+    """Gera a variante do logo MongoDB com wordmark branco (fundo escuro)."""
+    try:
+        if os.path.exists(_MDB) and not os.path.exists(_MDB_WHITE):
+            svg = open(_MDB, encoding="utf-8").read()
+            svg = svg.replace("#21313c", "#FFFFFF").replace("#21313C", "#FFFFFF")
+            open(_MDB_WHITE, "w", encoding="utf-8").write(svg)
+    except Exception:
+        pass
+
+
+def _uri(path: str) -> str:
+    """SVG -> data URI base64 (embarca a imagem direto no HTML)."""
+    try:
+        with open(path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode()
+        return f"data:image/svg+xml;base64,{b64}"
+    except Exception:
+        return ""
+
+
+_ensure_white_logo()
+_URI_BRASAO = _uri(_BRASAO)
+_URI_MDB = _uri(_MDB_WHITE if os.path.exists(_MDB_WHITE) else _MDB)
+_LOGO_APP = _MDB_WHITE if os.path.exists(_MDB_WHITE) else _MDB
 
 _CSS = """
 <style>
@@ -33,21 +68,32 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 [data-testid="stSidebar"] .stRadio [aria-checked="true"] + div { color: #00ED64 !important; }
 [data-testid="stSidebar"] hr { border-color: rgba(255,255,255,0.12); }
 
-/* ---- Cabecalho com gradiente ---- */
+/* ---- Cabecalho co-branded (Casa Civil DF + MongoDB) ---- */
 .dodf-header {
-  display: flex; align-items: center; gap: 14px;
-  padding: 18px 22px; margin-bottom: 18px;
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 16px; flex-wrap: wrap;
+  padding: 16px 24px; margin-bottom: 18px;
   background: linear-gradient(135deg, #00684A 0%, #001E2B 100%);
   border-radius: 16px; box-shadow: 0 6px 20px rgba(0,30,43,0.18);
+  border-top: 3px solid #00ED64;
 }
-.dodf-leaf { background: rgba(255,255,255,0.08); border-radius: 12px;
-  padding: 8px; display: flex; }
+.dodf-id { display: flex; align-items: center; gap: 14px; }
+.dodf-crest { height: 56px; width: auto; display: block;
+  background: rgba(255,255,255,0.10); border-radius: 12px; padding: 6px 8px; }
 .dodf-title { color: #fff; font-size: 1.35rem; font-weight: 700; line-height: 1.2; }
 .dodf-sub { color: #B8C4C2; font-size: 0.9rem; margin-top: 2px; }
+.dodf-cobrand { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
+.dodf-cobrand .cap { color: #9FB1AE; font-size: 0.62rem;
+  letter-spacing: 1.2px; text-transform: uppercase; }
+.dodf-mdb { height: 26px; width: auto; display: block; }
+.dodf-leaf { background: rgba(255,255,255,0.08); border-radius: 12px;
+  padding: 8px; display: flex; }
 
 /* ---- Marca da sidebar ---- */
-.dodf-brand { display: flex; align-items: center; gap: 10px; padding: 6px 0 12px; }
-.dodf-brand .n { color: #fff; font-weight: 700; font-size: 1.05rem; }
+.dodf-brand { display: flex; align-items: center; gap: 12px; padding: 4px 0 12px; }
+.dodf-brand-crest { height: 44px; width: auto; display: block;
+  background: rgba(255,255,255,0.06); border-radius: 10px; padding: 4px 6px; }
+.dodf-brand .n { color: #fff; font-weight: 700; font-size: 1.05rem; line-height: 1.15; }
 .dodf-brand .s { color: #00ED64; font-size: 0.78rem; }
 
 /* ---- Botoes ---- */
@@ -87,21 +133,37 @@ def aplicar_tema():
     st.markdown(_CSS, unsafe_allow_html=True)
 
 
+def marca_app():
+    """Logo MongoDB nativo no topo da sidebar. Chamar uma vez no inicio."""
+    try:
+        st.logo(_LOGO_APP, size="large", link="https://www.mongodb.com")
+    except Exception:
+        pass
+
+
 def cabecalho(titulo: str, subtitulo: str):
-    """Renderiza o cabecalho principal com a folha MongoDB."""
+    """Cabecalho co-branded: brasao da Casa Civil DF + marca MongoDB."""
+    crest = (f"<img class='dodf-crest' src='{_URI_BRASAO}' alt='Casa Civil DF'/>"
+             if _URI_BRASAO else f"<div class='dodf-leaf'>{_LEAF}</div>")
+    mdb = (f"<div class='dodf-cobrand'><span class='cap'>Powered by</span>"
+           f"<img class='dodf-mdb' src='{_URI_MDB}' alt='MongoDB'/></div>"
+           if _URI_MDB else "")
     st.markdown(
         f"<div class='dodf-header'>"
-        f"<div class='dodf-leaf'>{_LEAF}</div>"
+        f"<div class='dodf-id'>{crest}"
         f"<div><div class='dodf-title'>{titulo}</div>"
-        f"<div class='dodf-sub'>{subtitulo}</div></div></div>",
+        f"<div class='dodf-sub'>{subtitulo}</div></div></div>"
+        f"{mdb}</div>",
         unsafe_allow_html=True,
     )
 
 
 def marca_sidebar(secao: str):
-    """Renderiza a marca no topo da sidebar (chamar dentro de st.sidebar)."""
+    """Renderiza a marca institucional no topo da sidebar."""
+    crest = (f"<img class='dodf-brand-crest' src='{_URI_BRASAO}' alt='DF'/>"
+             if _URI_BRASAO else _LEAF)
     st.markdown(
-        f"<div class='dodf-brand'>{_LEAF}"
+        f"<div class='dodf-brand'>{crest}"
         f"<div><div class='n'>Casa Civil DF</div>"
         f"<div class='s'>{secao}</div></div></div>",
         unsafe_allow_html=True,

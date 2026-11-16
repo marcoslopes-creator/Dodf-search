@@ -9,11 +9,11 @@ Uso: python monitor_pasta.py
 import os
 import sys
 import time
-import glob
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from config import CFG
 from processar_pdf import processar_pdf
+from ingestao_paralela import ingerir_pasta
 
 
 class MonitorPDF(FileSystemEventHandler):
@@ -31,13 +31,8 @@ class MonitorPDF(FileSystemEventHandler):
 
 
 def processar_existentes(pasta: str):
-    pdfs = sorted(glob.glob(os.path.join(pasta, "*.pdf")))
-    print(f"\nEncontrados {len(pdfs)} PDFs em {pasta}\n")
-    for pdf in pdfs:
-        try:
-            processar_pdf(pdf, origem="monitor_pasta")
-        except Exception as e:
-            print(f"ERRO ao processar {os.path.basename(pdf)}: {e}")
+    """Varredura inicial paralela e resumivel (V2 #1)."""
+    ingerir_pasta(pasta=pasta, origem="monitor_pasta")
 
 
 def main():

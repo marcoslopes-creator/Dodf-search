@@ -1,0 +1,94 @@
+flowchart TB
+    USER(["👤 Usuario<br/>Casa Civil DF"])
+
+    subgraph APRES["🖥️ Camada de Apresentacao — Streamlit (chatbot.py + ui_theme.py)"]
+        direction LR
+        P_CHAT["💬 Chat com IA"]
+        P_BUSCA["🔍 Busca Textual"]
+        P_UP["📤 Upload PDFs"]
+        P_AUD["📋 Auditoria"]
+    end
+
+    subgraph APP["⚙️ Camada de Aplicacao — Python"]
+        direction TB
+        subgraph CONS["Consulta (runtime)"]
+            direction LR
+            NL2Q["nl2query.py<br/>interpreta -> filtros JSON"]
+            TOOLS["tools_dodf.py<br/>busca_rapida_paralela · consultar_atos<br/>verificar/salvar_cache · rerancar · metricas"]
+        end
+        subgraph INGE["Ingestao (pipeline)"]
+            direction LR
+            MON["monitor_pasta.py<br/>watchdog"]
+            IPAR["ingestao_paralela.py<br/>ProcessPoolExecutor (V2 #1)"]
+            PROC["processar_pdf.py<br/>extrair texto sort=True + limpeza + chunk"]
+            EXTR["extrator_atos.py<br/>regex + LLM hibrido"]
+            REF["reforco_atos.py / backfill_atos.py<br/>passada resumivel (V2 #4)"]
+        end
+        CFG["config.py<br/>settings + MongoClient pool max=100 (V2 #3)"]
+        SETUP["setup_mongodb.py · setup_indices_vetoriais.py<br/>indices B-tree + vetorial quantizado (V2 #2)"]
+    end
+
+    subgraph IA["🤖 Servicos de IA (externos)"]
+        direction LR
+        VOY["Voyage AI<br/>embeddings 1024d + rerank-2.5"]
+        CLA["Anthropic Claude<br/>respostas + extracao de atos"]
+        GEM["Google Gemini<br/>OCR fallback"]
+    end
+
+    subgraph DADOS["🍃 Camada de Dados — MongoDB Atlas"]
+        direction TB
+        subgraph COLS["Colecoes"]
+            direction LR
+            C_DOC[("documentos<br/>chunks + embedding")]
+            C_ATOS[("atos<br/>estruturado")]
+            C_CACHE[("cache_semantico")]
+            C_MET[("metricas / feedback<br/>historico / auditoria")]
+            C_PDF[("pdfs — GridFS")]
+        end
+        subgraph IDX["Indices"]
+            direction LR
+            I_VEC{{"busca_vetorial<br/>scalar quantization (V2 #2)"}}
+            I_CACHE{{"cache_vetorial"}}
+            I_TXT{{"Atlas Search textual"}}
+            I_BT{{"B-tree em atos<br/>nome/tipo/ano/orgao"}}
+        end
+    end
+
+    %% ---- Fluxo de consulta ----
+    USER --> APRES
+    P_CHAT --> NL2Q --> TOOLS
+    P_BUSCA --> TOOLS
+    P_AUD --> C_MET
+    TOOLS -->|"embeddings + rerank"| VOY
+    TOOLS -->|"geracao de resposta"| CLA
+    TOOLS -->|"vectorSearch / agregacao"| COLS
+
+    %% ---- Fluxo de ingestao ----
+    P_UP --> PROC
+    MON --> IPAR --> PROC
+    PROC -->|"embeddings lote"| VOY
+    PROC -->|"pagina ruim -> OCR"| GEM
+    PROC --> EXTR
+    EXTR -->|"gatilho sem regex"| CLA
+    REF --> EXTR
+    PROC -->|"grava chunks/atos"| COLS
+    REF --> C_ATOS
+
+    %% ---- Infra transversal ----
+    CFG -. "pool de conexao" .-> DADOS
+    SETUP -. "cria/mantem" .-> IDX
+    COLS --- IDX
+
+    classDef user fill:#00684A,stroke:#00382a,color:#fff,font-weight:bold;
+    classDef ui fill:#E8F1EF,stroke:#5A7D75,color:#0b2b24;
+    classDef app fill:#EAF3FF,stroke:#3B6BA5,color:#0b2540;
+    classDef ai fill:#FFF3D6,stroke:#B8860B,color:#3d2c00;
+    classDef data fill:#CBE9DB,stroke:#00684A,color:#00251a;
+    classDef idx fill:#00ED64,stroke:#00684A,color:#001E2B,font-weight:bold;
+
+    class USER user;
+    class P_CHAT,P_BUSCA,P_UP,P_AUD ui;
+    class NL2Q,TOOLS,MON,IPAR,PROC,EXTR,REF,CFG,SETUP app;
+    class VOY,CLA,GEM ai;
+    class C_DOC,C_ATOS,C_CACHE,C_MET,C_PDF data;
+    class I_VEC,I_CACHE,I_TXT,I_BT idx;

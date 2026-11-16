@@ -2,7 +2,13 @@
 tools_dodf.py — Ferramentas do Agente + Utilitarios
 =====================================================
 - 10 ferramentas LangGraph (com tracking de tempo)
-- Cache semantico, metricas, feedback, historico, auditoria
+- Busca vetorial com Atlas Automated Embedding: a consulta vai como TEXTO
+  no $vectorSearch e o Atlas gera o vetor (voyage-4-lite); os documentos
+  foram indexados com voyage-4-large (asymmetric retrieval)
+- Pre-filtros do $vectorSearch extraidos da pergunta (data/edicao/tipo)
+- Busca hibrida via $rankFusion (RRF no servidor, uma consulta) com
+  fallback para fusao no cliente (duas consultas em paralelo)
+- Cache semantico (autoEmbed), metricas, feedback, historico, auditoria
 - Reranking Voyage 4 nos resultados de busca
 - Funcoes de gestao de PDFs (listar, excluir)
 """
@@ -14,13 +20,102 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from typing import Optional
 from langchain_core.tools import tool
-from config import (get_db, get_collection, get_gridfs,
-                     gerar_embedding, rerancar, CFG)
+from config import get_db, get_collection, get_gridfs, rerancar, CFG
 from extrator_atos import normalizar, tipo_canonico
 
 _MESES = {"janeiro": 1, "fevereiro": 2, "marco": 3, "março": 3, "abril": 4,
           "maio": 5, "junho": 6, "julho": 7, "agosto": 8, "setembro": 9,
           "outubro": 10, "novembro": 11, "dezembro": 12}
+_MESES_RE = "|".join(sorted(_MESES, key=len, reverse=True))
+
+# Padroes de recorte temporal / de edicao na pergunta
+_RE_DATA_NUM = re.compile(r'\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b')
+_RE_DATA_EXT = re.compile(
+    rf'\b(\d{{1,2}})\s+de\s+({_MESES_RE})\s+de\s+(\d{{4}})\b', re.IGNORECASE)
+_RE_MES_ANO = re.compile(
+    rf'\b(?:em|de|do|no|durante)\s+({_MESES_RE})\s*(?:de|/)\s*(\d{{4}})\b',
+    re.IGNORECASE)
+_RE_EDICAO_NUM = re.compile(
+    r'\b(?:edi[cç][aã]o|dodf)\s*(?:n[º°o.]?\s*)?(\d{1,4})\b', re.IGNORECASE)
+_RE_EXTRA = re.compile(r'\bedi[cç][aã]o\s+extra(?:\s+([a-d]))?\b', re.IGNORECASE)
+_RE_SUPLEMENTO = re.compile(r'\bsuplemento\b', re.IGNORECASE)
+_TIPOS_EXTRA = ["EDICAO EXTRA A", "EDICAO EXTRA B", "EDICAO EXTRA C", "EDICAO EXTRA D"]
+
+
+# =====================================================================
+# PRE-FILTROS — recorte de edicao extraido da pergunta
+# =====================================================================
+
+def extrair_filtros(consulta: str) -> Optional[dict]:
+    """Deriva pre-filtros de metadados a partir da pergunta.
+
+    Retorna None quando a pergunta nao tem recorte (comportamento padrao:
+    busca em toda a base). Caso contrario, retorna:
+      {"mql": {...},        # para $vectorSearch.filter
+       "search": [...],     # clausulas para $search.compound.filter
+       "descricao": "..."}  # legivel, para logs/UI
+    Filtros sao exatos e so usam campos indexados como 'filter'.
+    """
+    if not CFG.VECTOR_PREFILTER_ENABLED or not consulta:
+        return None
+    mql, search, desc = {}, [], []
+
+    m = _RE_DATA_NUM.search(consulta) or None
+    if m:
+        d, mo, a = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    else:
+        m = _RE_DATA_EXT.search(consulta)
+        if m:
+            d, mo, a = int(m.group(1)), _MESES[m.group(2).lower()], int(m.group(3))
+    if m:
+        try:
+            ini = datetime(a, mo, d)
+            fim = ini + timedelta(days=1)
+            mql["metadados.data"] = {"$gte": ini, "$lt": fim}
+            search.append({"range": {"path": "metadados.data", "gte": ini, "lt": fim}})
+            desc.append(f"data={ini:%d/%m/%Y}")
+        except ValueError:
+            pass
+    else:
+        m = _RE_MES_ANO.search(consulta)
+        if m:
+            mo, a = _MESES[m.group(1).lower()], int(m.group(2))
+            ini = datetime(a, mo, 1)
+            fim = datetime(a + (mo == 12), mo % 12 + 1, 1)
+            mql["metadados.data"] = {"$gte": ini, "$lt": fim}
+            search.append({"range": {"path": "metadados.data", "gte": ini, "lt": fim}})
+            desc.append(f"mes={mo:02d}/{a}")
+
+    m = _RE_EDICAO_NUM.search(consulta)
+    if m and 0 < int(m.group(1)) <= 400:   # evita "DODF 2025" (ano) como edicao
+        n = int(m.group(1))
+        mql["metadados.numero_edicao"] = n
+        search.append({"equals": {"path": "metadados.numero_edicao", "value": n}})
+        desc.append(f"edicao={n}")
+
+    m = _RE_EXTRA.search(consulta)
+    if m:
+        if m.group(1):
+            tipos = [f"EDICAO EXTRA {m.group(1).upper()}"]
+        else:
+            tipos = _TIPOS_EXTRA
+        mql["metadados.tipo_edicao"] = {"$in": tipos}
+        search.append({"text": {"path": "metadados.tipo_edicao", "query": tipos}})
+        desc.append("tipo=EXTRA" + (f" {m.group(1).upper()}" if m.group(1) else ""))
+    elif _RE_SUPLEMENTO.search(consulta):
+        mql["metadados.tipo_edicao"] = "SUPLEMENTO"
+        search.append({"text": {"path": "metadados.tipo_edicao", "query": "SUPLEMENTO"}})
+        desc.append("tipo=SUPLEMENTO")
+
+    if not mql:
+        return None
+    return {"mql": mql, "search": search, "descricao": ", ".join(desc)}
+
+
+def _filtro_arquivo(nome_arquivo: str) -> dict:
+    return {"mql": {"metadados.arquivo": nome_arquivo},
+            "search": [{"text": {"path": "metadados.arquivo", "query": nome_arquivo}}],
+            "descricao": f"arquivo={nome_arquivo}"}
 
 
 # =====================================================================
@@ -177,19 +272,43 @@ def busca_textual_contagem(consulta: str) -> int:
 
 
 # =====================================================================
-# BUSCA PARALELA + RERANKING (pipeline rapido)
+# BUSCA HIBRIDA ($rankFusion ou paralela no cliente) + RERANKING
 # =====================================================================
 
-def _busca_txt_raw(col, q: str, lim: int = 8) -> list:
+def _stage_search(q: str, filtros: dict = None) -> dict:
+    """Stage $search (indice busca_textual) com pre-filtro opcional."""
+    compound = {"should": [
+        {"text": {"query": q, "path": "texto",
+                  "fuzzy": {"maxEdits": 2, "prefixLength": 1, "maxExpansions": 50}}},
+        {"text": {"query": q, "path": "texto.fonetico"}},
+        {"text": {"query": q, "path": "texto.normalizado",
+                  "fuzzy": {"maxEdits": 2, "prefixLength": 1, "maxExpansions": 50}}},
+        {"phrase": {"query": q, "path": "texto"}}
+    ]}
+    if filtros and filtros.get("search"):
+        compound["filter"] = filtros["search"]
+    return {"$search": {"index": "busca_textual", "compound": compound}}
+
+
+def _stage_vector(consulta: str, lim: int, filtros: dict = None) -> dict:
+    """Stage $vectorSearch com Automated Embedding: envia o TEXTO da consulta
+    e o Atlas gera o vetor com CFG.VOYAGE_QUERY_MODEL (modelo leve, compativel
+    com o voyage-4-large usado nos documentos). 'filtros' restringe o espaco
+    de busca antes do HNSW (pre-filter)."""
+    # numCandidates configuravel (CFG) p/ tuning de recall x latencia com
+    # indice quantizado. Floor relativo ao limite garante candidatos suficientes.
+    num_cand = max(CFG.VECTOR_NUM_CANDIDATES, lim * 10)
+    stage = {"index": CFG.VECTOR_INDEX_NAME, "path": CFG.VECTOR_FIELD,
+             "query": consulta, "model": CFG.VOYAGE_QUERY_MODEL,
+             "numCandidates": num_cand, "limit": lim}
+    if filtros and filtros.get("mql"):
+        stage["filter"] = filtros["mql"]
+    return {"$vectorSearch": stage}
+
+
+def _busca_txt_raw(col, q: str, lim: int = 8, filtros: dict = None) -> list:
     pipe = [
-        {"$search": {"index": "busca_textual", "compound": {"should": [
-            {"text": {"query": q, "path": "texto",
-                      "fuzzy": {"maxEdits": 2, "prefixLength": 1, "maxExpansions": 50}}},
-            {"text": {"query": q, "path": "texto.fonetico"}},
-            {"text": {"query": q, "path": "texto.normalizado",
-                      "fuzzy": {"maxEdits": 2, "prefixLength": 1, "maxExpansions": 50}}},
-            {"phrase": {"query": q, "path": "texto"}}
-        ]}}},
+        _stage_search(q, filtros),
         {"$project": {"texto": 1, "metadados": 1, "score": {"$meta": "searchScore"}}},
         {"$limit": lim}
     ]
@@ -199,10 +318,9 @@ def _busca_txt_raw(col, q: str, lim: int = 8) -> list:
         return []
 
 
-def _busca_sem_raw(col, vetor: list, lim: int = 8) -> list:
+def _busca_sem_raw(col, consulta: str, lim: int = 8, filtros: dict = None) -> list:
     pipe = [
-        {"$vectorSearch": {"index": "busca_vetorial", "path": "embedding",
-                            "queryVector": vetor, "numCandidates": 150, "limit": lim}},
+        _stage_vector(consulta, lim, filtros),
         {"$project": {"texto": 1, "metadados": 1, "score": {"$meta": "vectorSearchScore"}}}
     ]
     try:
@@ -211,27 +329,69 @@ def _busca_sem_raw(col, vetor: list, lim: int = 8) -> list:
         return []
 
 
-def busca_rapida_paralela(consulta: str, vetor: list, limite: int = 6) -> list:
-    """Textual + semantica em paralelo, depois rerank Voyage 4."""
-    col = get_collection()
-    # Busca mais resultados para o rerank ter o que escolher
-    lim_busca = max(limite * 3, 15)
+_ROTULO_RAMO = {"textual": "Textual", "semantica": "Semantica"}
 
-    t0 = time.time()
+
+def _busca_fusao_raw(col, consulta: str, lim: int, filtros: dict = None,
+                     detalhes: bool = False) -> list:
+    """$rankFusion (MongoDB >= 8.1): $search e $vectorSearch executados e
+    fundidos no servidor por Reciprocal Rank Fusion, em uma unica consulta,
+    com pesos por ramo (CFG). Cada resultado recebe:
+      score        -> score RRF combinado
+      tipo_busca   -> 'Hibrida'; com detalhes=True, 'Textual', 'Semantica'
+                      ou 'Textual+Semantica' (origem real)
+      score_sem    -> score bruto do $vectorSearch (so com detalhes=True)
+    'detalhes' pede scoreDetails ao servidor (~+150 ms); use apenas quando
+    a origem/score por ramo for necessaria (ex.: RERANK_SKIP_SCORE).
+    Levanta excecao se o stage nao for suportado, para o chamador recuar
+    para a fusao no cliente."""
+    stage = {
+        "input": {"pipelines": {
+            "textual": [_stage_search(consulta, filtros), {"$limit": lim}],
+            "semantica": [_stage_vector(consulta, lim, filtros)]}},
+        "combination": {"weights": {
+            "textual": CFG.RANKFUSION_PESO_TEXTUAL,
+            "semantica": CFG.RANKFUSION_PESO_SEMANTICO}}}
+    proj = {"texto": 1, "metadados": 1, "score": {"$meta": "score"}}
+    if detalhes:
+        stage["scoreDetails"] = True
+        proj["_detalhes"] = {"$meta": "scoreDetails"}
+    pipe = [
+        {"$rankFusion": stage},
+        # Uniao dos ramos (ate 2*lim): mesmo pool de candidatos que a fusao
+        # no cliente entrega ao reranker.
+        {"$limit": lim * 2},
+        {"$project": proj}
+    ]
+    res = list(col.aggregate(pipe))
+    for r in res:
+        r["tipo_busca"] = "Hibrida"
+        if not detalhes:
+            continue
+        ramos = [d for d in r.pop("_detalhes", {}).get("details", [])
+                 if d.get("rank") != "NA"]
+        r["tipo_busca"] = "+".join(
+            _ROTULO_RAMO[d["inputPipelineName"]] for d in ramos
+            if d.get("inputPipelineName") in _ROTULO_RAMO) or "Hibrida"
+        for d in ramos:
+            if d.get("inputPipelineName") == "semantica":
+                r["score_sem"] = d.get("value", 0)
+    return res
+
+
+def _busca_paralela_cliente(col, consulta: str, lim: int, filtros: dict) -> list:
+    """Fusao no cliente (fallback): duas consultas em paralelo, intercalacao
+    textual/semantica com deduplicacao por _id."""
     with ThreadPoolExecutor(max_workers=2) as ex:
-        f1 = ex.submit(_busca_txt_raw, col, consulta, lim_busca)
-        f2 = ex.submit(_busca_sem_raw, col, vetor, lim_busca)
+        f1 = ex.submit(_busca_txt_raw, col, consulta, lim, filtros)
+        f2 = ex.submit(_busca_sem_raw, col, consulta, lim, filtros)
         txt, sem = f1.result(), f2.result()
-    ms_busca = int((time.time() - t0) * 1000)
-    _timings_atual.append({"ferramenta": "busca_paralela_mongodb",
-                           "tempo_ms": ms_busca, "sucesso": True})
-
     for r in txt:
         r["tipo_busca"] = "Textual"
     for r in sem:
         r["tipo_busca"] = "Semantica"
+        r["score_sem"] = r.get("score", 0)
 
-    # Combina deduplicando
     ids, comb = set(), []
     it, iss = 0, 0
     while it < len(txt) or iss < len(sem):
@@ -249,9 +409,47 @@ def busca_rapida_paralela(consulta: str, vetor: list, limite: int = 6) -> list:
                 ids.add(rid)
                 comb.append(sem[iss - 1])
                 break
+    return comb
 
-    # Rerank com Voyage 4
-    if CFG.RERANK_ENABLED and len(comb) > limite:
+
+def busca_rapida_paralela(consulta: str, limite: int = 6,
+                          filtros: dict = None) -> list:
+    """Busca hibrida textual + semantica, depois rerank Voyage 4.
+
+    Com CFG.RANKFUSION_ENABLED, a fusao e feita pelo Atlas ($rankFusion, uma
+    consulta); senao (ou se o stage falhar), duas consultas em paralelo com
+    fusao no cliente. 'filtros' (opcional) vem de extrair_filtros()/
+    _filtro_arquivo(); quando None, e derivado da propria consulta.
+    """
+    col = get_collection()
+    if filtros is None:
+        filtros = extrair_filtros(consulta)
+    # Busca mais resultados para o rerank ter o que escolher
+    lim_busca = max(limite * 3, 15)
+
+    t0 = time.time()
+    comb, modo = None, "rankfusion_mongodb"
+    if CFG.RANKFUSION_ENABLED:
+        try:
+            comb = _busca_fusao_raw(col, consulta, lim_busca, filtros,
+                                    detalhes=CFG.RERANK_SKIP_SCORE > 0)
+        except Exception:
+            comb = None
+    if comb is None:
+        modo = "busca_paralela_mongodb"
+        comb = _busca_paralela_cliente(col, consulta, lim_busca, filtros)
+    ms_busca = int((time.time() - t0) * 1000)
+    _timings_atual.append({"ferramenta": modo,
+                           "tempo_ms": ms_busca, "sucesso": True,
+                           "prefiltro": filtros["descricao"] if filtros else None})
+
+    # Rerank condicional: pula a ida extra a API quando ha um vencedor claro
+    # (melhor score semantico >= RERANK_SKIP_SCORE), reduzindo latencia.
+    melhor_sem = max((r.get("score_sem", 0) for r in comb), default=0)
+    pular_rerank = (CFG.RERANK_SKIP_SCORE > 0
+                    and melhor_sem >= CFG.RERANK_SKIP_SCORE)
+
+    if CFG.RERANK_ENABLED and len(comb) > limite and not pular_rerank:
         t0 = time.time()
         comb = rerancar(consulta, comb, top_k=limite)
         ms_rerank = int((time.time() - t0) * 1000)
@@ -267,17 +465,19 @@ def busca_rapida_paralela(consulta: str, vetor: list, limite: int = 6) -> list:
 # CACHE SEMANTICO / METRICAS / FEEDBACK / HISTORICO / AUDITORIA
 # =====================================================================
 
-def verificar_cache(pergunta: str, vetor: list = None,
-                    limiar: float = 0.97) -> Optional[str]:
+def verificar_cache(pergunta: str, limiar: float = None) -> Optional[str]:
+    """Cache semantico via autoEmbed: o Atlas embeda a pergunta (modelo do
+    indice, CFG.CACHE_EMBEDDING_MODEL) e compara com perguntas ja respondidas."""
+    if limiar is None:
+        limiar = CFG.CACHE_SIMILARITY
     try:
         db = get_db()
-        if vetor is None:
-            vetor = gerar_embedding(pergunta)
         r = list(db["cache_semantico"].aggregate([
-            {"$vectorSearch": {"index": "cache_vetorial",
-                                "path": "pergunta_embedding",
-                                "queryVector": vetor,
-                                "numCandidates": 10, "limit": 1}},
+            {"$vectorSearch": {"index": CFG.CACHE_INDEX_NAME,
+                                "path": CFG.CACHE_VECTOR_FIELD,
+                                "query": pergunta,
+                                "numCandidates": CFG.CACHE_NUM_CANDIDATES,
+                                "limit": 1}},
             {"$project": {"resposta": 1, "score": {"$meta": "vectorSearchScore"}}}
         ]))
         if r and r[0].get("score", 0) >= limiar:
@@ -287,13 +487,12 @@ def verificar_cache(pergunta: str, vetor: list = None,
     return None
 
 
-def salvar_cache(pergunta, resposta, ferramentas, modelo, vetor=None):
+def salvar_cache(pergunta, resposta, ferramentas, modelo):
+    """Grava a entrada; o vetor de 'pergunta' e gerado pelo indice autoEmbed."""
     try:
         db = get_db()
-        if vetor is None:
-            vetor = gerar_embedding(pergunta)
         db["cache_semantico"].insert_one({
-            "pergunta": pergunta, "pergunta_embedding": vetor,
+            "pergunta": pergunta,
             "resposta": resposta, "ferramentas_usadas": ferramentas,
             "modelo": modelo, "criado_em": datetime.now(),
             "ttl": datetime.now() + timedelta(days=7)
@@ -465,9 +664,14 @@ def excluir_pdf(hash_md5: str):
 @tool
 @_track_tempo("busca_hibrida")
 def busca_hibrida(consulta: str, limite: int = 8) -> str:
-    """Busca combinada textual + semantica + reranking. Primeira opcao."""
-    vetor = gerar_embedding(consulta)
-    return _fmt(busca_rapida_paralela(consulta, vetor, limite), limite)
+    """Busca combinada textual + semantica + reranking. Primeira opcao.
+    Se a consulta citar data (ex.: 17/01/2025, janeiro de 2025), numero de
+    edicao (edicao 12) ou tipo (edicao extra, suplemento), a busca e
+    restrita automaticamente a essas edicoes."""
+    filtros = extrair_filtros(consulta)
+    res = busca_rapida_paralela(consulta, limite, filtros)
+    cab = f"[pre-filtro: {filtros['descricao']}]\n" if filtros else ""
+    return cab + _fmt(res, limite)
 
 
 @tool
@@ -481,9 +685,9 @@ def busca_textual_fuzzy(consulta: str, limite: int = 8) -> str:
 @tool
 @_track_tempo("busca_semantica")
 def busca_semantica(consulta: str, limite: int = 8) -> str:
-    """Busca por significado usando vetores Voyage 4."""
-    return _fmt(_busca_sem_raw(get_collection(),
-                                gerar_embedding(consulta), limite), limite)
+    """Busca por significado usando vetores Voyage 4 (Atlas autoEmbed)."""
+    return _fmt(_busca_sem_raw(get_collection(), consulta, limite,
+                                extrair_filtros(consulta)), limite)
 
 
 @tool
@@ -537,21 +741,11 @@ def contar_e_agrupar(termos_busca: str) -> str:
 @tool
 @_track_tempo("buscar_em_arquivo")
 def buscar_em_arquivo(nome_arquivo: str, consulta: str) -> str:
-    """Busca dentro de um PDF especifico."""
-    col = get_collection()
-    pipe = [
-        {"$search": {"index": "busca_textual", "compound": {
-            "must": [{"text": {"query": consulta, "path": "texto",
-                                "fuzzy": {"maxEdits": 1, "prefixLength": 1,
-                                          "maxExpansions": 50}}}],
-            "filter": [{"text": {"query": nome_arquivo,
-                                  "path": "metadados.arquivo"}}]
-        }}},
-        {"$project": {"texto": 1, "metadados": 1, "score": {"$meta": "searchScore"}}},
-        {"$limit": 8}
-    ]
+    """Busca dentro de um PDF especifico (textual + semantica com pre-filtro
+    de arquivo + reranking). nome_arquivo deve ser o nome exato do PDF."""
     try:
-        return _fmt(list(col.aggregate(pipe)), 8)
+        res = busca_rapida_paralela(consulta, 8, _filtro_arquivo(nome_arquivo))
+        return _fmt(res, 8)
     except Exception as e:
         return f"Erro: {e}"
 
